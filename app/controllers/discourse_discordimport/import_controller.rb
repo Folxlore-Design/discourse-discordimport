@@ -70,10 +70,20 @@ class DiscourseDiscordimport::ImportController < ::ApplicationController
     Zlib::GzipReader.open(file.path) do |gz|
       Gem::Package::TarReader.new(gz) do |tar|
         tar.each do |entry|
-          next unless entry.file? && entry.full_name.end_with?(".json")
-          data = JSON.parse(entry.read)
+          next unless entry.file?
+          # Don't filter by .json extension here — archives with long filenames or
+          # non-ASCII characters use PAX extended headers, which causes TarReader
+          # to yield the actual file entry with an empty/truncated full_name.
+          # Instead, attempt JSON parsing and validate structure.
+          content = entry.read
+          next if content.nil? || content.empty?
+          begin
+            data = JSON.parse(content)
+          rescue JSON::ParserError
+            next
+          end
           next unless data["channel"] && data["messages"]
-          data["_file_name"] = File.basename(entry.full_name)
+          data["_file_name"] = File.basename(entry.full_name.to_s)
           exports << data
         end
       end
