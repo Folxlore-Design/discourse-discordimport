@@ -7,8 +7,6 @@
 # url: https://github.com/branwyn/discourse-discordimport
 # component: false
 
-gem "rubyzip", "2.3.2"
-
 register_asset "stylesheets/discord-import.scss"
 
 enabled_site_setting :discordimport_enabled
