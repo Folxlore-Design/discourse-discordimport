@@ -30,8 +30,9 @@ module DiscourseDiscordimport
           message_count: importable,
           skipped_count: skipped,
         }.merge(threads: [])
-        channels_by_id[ch["id"]]    = entry
-        channels_by_name[ch["name"]] = entry
+        channels_by_id[ch["id"]]               = entry
+        channels_by_name[ch["name"]]           = entry
+        channels_by_name[ch["name"].downcase]  = entry
       end
 
       # Pass 2: everything else is a potential thread.
@@ -64,7 +65,9 @@ module DiscourseDiscordimport
 
         if parent.nil? && thread[:file_name]
           parent_name = extract_parent_channel_name(thread[:file_name])
-          parent = channels_by_name[parent_name] if parent_name
+          if parent_name
+            parent = channels_by_name[parent_name] || channels_by_name[parent_name.downcase]
+          end
         end
 
         if parent

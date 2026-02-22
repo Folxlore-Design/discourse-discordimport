@@ -59,10 +59,10 @@ async function postFormData(url, formData) {
 // Sub-component: topic search picker
 // ---------------------------------------------------------------------------
 class TopicPickerInput extends Component {
-  @tracked searchTerm = "";
+  // Initialize from parent-stored title so the field survives component recreation
+  @tracked searchTerm = this.args.selectedTitle ?? "";
   @tracked searchResults = [];
   @tracked searching = false;
-  @tracked selectedTitle = null;
 
   @action
   async onSearchInput(event) {
@@ -82,18 +82,19 @@ class TopicPickerInput extends Component {
   }
 
   @action
-  selectTopic(topic) {
-    this.selectedTitle = topic.title;
+  selectTopic(topic, event) {
+    // mousedown + preventDefault keeps input focused so blur doesn't fire first
+    event.preventDefault();
     this.searchTerm = topic.title;
     this.searchResults = [];
-    this.args.onChange(topic.id);
+    this.args.onChange(topic.id, topic.title);
   }
 
   <template>
     <div class="topic-picker">
       <input
         type="text"
-        class="topic-search-input"
+        class="topic-search-input {{if this.args.selectedTitle "has-selection"}}"
         placeholder="Search for a topic…"
         value={{this.searchTerm}}
         {{on "input" this.onSearchInput}}
@@ -105,15 +106,12 @@ class TopicPickerInput extends Component {
         <ul class="topic-search-results">
           {{#each this.searchResults as |topic|}}
             <li>
-              <button type="button" {{on "click" (fn this.selectTopic topic)}}>
+              <button type="button" {{on "mousedown" (fn this.selectTopic topic)}}>
                 {{topic.title}}
               </button>
             </li>
           {{/each}}
         </ul>
-      {{/if}}
-      {{#if this.selectedTitle}}
-        <span class="topic-selected-label">→ {{this.selectedTitle}}</span>
       {{/if}}
     </div>
   </template>
@@ -317,7 +315,7 @@ export default class AdminDiscordImport extends Component {
         config: {
           action: "skip",       // "skip" | "existing" | "create"
           topic_id: null,
-          topic_search: "",
+          topic_title: null,
           new_topic_title: ch.channel_name,
           new_topic_category_id: null,
           split_threads: false,
@@ -355,10 +353,10 @@ export default class AdminDiscordImport extends Component {
   }
 
   @action
-  setChannelTopicId(channel, topicId) {
+  setChannelTopicId(channel, topicId, topicTitle) {
     this.channels = this.channels.map((ch) =>
       ch === channel
-        ? { ...ch, config: { ...ch.config, topic_id: topicId } }
+        ? { ...ch, config: { ...ch.config, topic_id: topicId, topic_title: topicTitle } }
         : ch
     );
   }
@@ -580,6 +578,7 @@ export default class AdminDiscordImport extends Component {
                 {{#if (eq channel.config.action "existing")}}
                   <label>Topic</label>
                   <TopicPickerInput
+                    @selectedTitle={{channel.config.topic_title}}
                     @onChange={{(fn this.setChannelTopicId channel)}}
                   />
                 {{/if}}
