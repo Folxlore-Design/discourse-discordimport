@@ -281,6 +281,9 @@ export default class AdminDiscordImport extends Component {
   // User mappings: { discord_id -> discourse_user_id | "omit" | "anonymous" }
   userMappings = {};
 
+  // Duplicate post handling: "ignore" | "update"
+  @tracked duplicateMode = "ignore";
+
   // Confirmation modal
   @tracked showConfirmModal = false;
   @tracked importError = null;
@@ -387,6 +390,11 @@ export default class AdminDiscordImport extends Component {
     );
   }
 
+  @action
+  setDuplicateMode(event) {
+    this.duplicateMode = event.target.value;
+  }
+
   // ---------------------------------------------------------------------------
   // User mapping callback (passed to UserMappingRow)
   // ---------------------------------------------------------------------------
@@ -454,6 +462,7 @@ export default class AdminDiscordImport extends Component {
       fd.append("file", this.selectedFile);
       fd.append("channel_configs", JSON.stringify(channelConfigs));
       fd.append("user_mappings", JSON.stringify(this.userMappings));
+      fd.append("duplicate_mode", this.duplicateMode);
 
       const result = await postFormData("/discordimport/import", fd);
       this.importResults = result.results ?? [];
@@ -516,6 +525,34 @@ export default class AdminDiscordImport extends Component {
         {{#if this.importError}}
           <p class="discord-import-error">{{this.importError}}</p>
         {{/if}}
+
+        {{!-- SECTION: Options --}}
+        <section class="discord-import-options">
+          <h2>Options</h2>
+          <fieldset class="duplicate-mode-fieldset">
+            <legend>Duplicate Posts</legend>
+            <label>
+              <input
+                type="radio"
+                name="duplicate-mode"
+                value="ignore"
+                checked={{eq this.duplicateMode "ignore"}}
+                {{on "change" this.setDuplicateMode}}
+              />
+              Ignore — skip posts already imported
+            </label>
+            <label>
+              <input
+                type="radio"
+                name="duplicate-mode"
+                value="update"
+                checked={{eq this.duplicateMode "update"}}
+                {{on "change" this.setDuplicateMode}}
+              />
+              Update — overwrite existing post content
+            </label>
+          </fieldset>
+        </section>
 
         {{!-- SECTION A: Channels --}}
         <section class="discord-import-channels">
@@ -636,6 +673,9 @@ export default class AdminDiscordImport extends Component {
               <strong>#{{result.channel_name}}</strong>
               <span>
                 {{result.posts_created}} posts imported
+                {{#if result.posts_updated}}
+                  · {{result.posts_updated}} updated
+                {{/if}}
                 {{#if result.posts_skipped}}
                   · {{result.posts_skipped}} skipped
                 {{/if}}
@@ -648,7 +688,9 @@ export default class AdminDiscordImport extends Component {
                   {{#each result.thread_results as |tr|}}
                     <li>
                       Thread: {{tr.thread_name}} —
-                      {{tr.posts_created}} posts ·
+                      {{tr.posts_created}} posts
+                      {{#if tr.posts_updated}}· {{tr.posts_updated}} updated{{/if}}
+                      ·
                       <a href={{tr.topic_url}} target="_blank" rel="noopener noreferrer">View</a>
                     </li>
                   {{/each}}

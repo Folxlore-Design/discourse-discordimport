@@ -19,11 +19,13 @@ class DiscourseDiscordimport::ImportController < ::ApplicationController
 
     channel_configs = JSON.parse(params.require(:channel_configs))
     user_mappings   = JSON.parse(params.require(:user_mappings))
+    duplicate_mode  = params[:duplicate_mode].presence || "ignore"
 
     result = DiscourseDiscordimport::DiscordImporter.import(
       exports,
       channel_configs,
       user_mappings,
+      duplicate_mode: duplicate_mode,
     )
 
     render json: result

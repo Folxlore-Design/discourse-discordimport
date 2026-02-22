@@ -86,12 +86,13 @@ module DiscourseDiscordimport
     end
 
     # ---------------------------------------------------------------------------
-    # import(exports, channel_configs, user_mappings) → results hash
+    # import(exports, channel_configs, user_mappings, duplicate_mode:) → results hash
     #
     # channel_configs: array of hashes (action, channel_id, topic_id, etc.)
     # user_mappings:   { discord_user_id => discourse_user_id | "omit" | "anonymous" }
+    # duplicate_mode:  "ignore" | "update"
     # ---------------------------------------------------------------------------
-    def self.import(exports, channel_configs, user_mappings)
+    def self.import(exports, channel_configs, user_mappings, duplicate_mode: "ignore")
       # Index exports by channel id for fast lookup
       exports_by_channel_id = {}
       exports.each do |export|
@@ -122,24 +123,25 @@ module DiscourseDiscordimport
         end
 
         # Resolve the primary topic
-        topic, posts_created, posts_skipped =
+        topic, posts_created, posts_skipped, posts_updated =
           if action == "existing"
             topic = Topic.find_by(id: config["topic_id"])
             raise "Topic #{config["topic_id"]} not found" unless topic
-            created, skipped = import_messages(
+            created, skipped, updated = import_messages(
               main_export["messages"] || [],
               topic.id,
               user_mappings,
+              duplicate_mode: duplicate_mode,
             )
-            [topic, created, skipped]
+            [topic, created, skipped, updated]
           else
-            created_topic, created, skipped = create_topic_from_export(
+            create_topic_from_export(
               main_export,
               config["new_topic_title"] || main_export.dig("channel", "name"),
               config["new_topic_category_id"],
               user_mappings,
+              duplicate_mode: duplicate_mode,
             )
-            [created_topic, created, skipped]
           end
 
         next unless topic
@@ -151,11 +153,12 @@ module DiscourseDiscordimport
             thread_name = te.dig("channel", "name")
             category_id = topic.category_id
 
-            thread_topic, t_created, t_skipped = create_topic_from_export(
+            thread_topic, t_created, t_skipped, t_updated = create_topic_from_export(
               te,
               thread_name,
               category_id,
               user_mappings,
+              duplicate_mode: duplicate_mode,
             )
             next unless thread_topic
 
@@ -165,6 +168,7 @@ module DiscourseDiscordimport
               topic_url:     thread_topic.url,
               posts_created: t_created,
               posts_skipped: t_skipped,
+              posts_updated: t_updated,
             }
           end
         else
@@ -188,18 +192,20 @@ module DiscourseDiscordimport
               )
             end
 
-            t_created, t_skipped = import_messages(messages, topic.id, user_mappings)
+            t_created, t_skipped, t_updated = import_messages(messages, topic.id, user_mappings, duplicate_mode: duplicate_mode)
             posts_created += t_created
             posts_skipped += t_skipped
+            posts_updated += t_updated
           end
         end
 
         results << {
-          channel_name:  channel_name,
-          topic_id:      topic.id,
-          topic_url:     topic.url,
-          posts_created: posts_created,
-          posts_skipped: posts_skipped,
+          channel_name:   channel_name,
+          topic_id:       topic.id,
+          topic_url:      topic.url,
+          posts_created:  posts_created,
+          posts_skipped:  posts_skipped,
+          posts_updated:  posts_updated,
           thread_results: thread_results,
         }
       end
@@ -325,8 +331,9 @@ module DiscourseDiscordimport
       parts.join("\n\n")
     end
 
-    def self.create_topic_from_export(export, title, category_id, user_mappings)
+    def self.create_topic_from_export(export, title, category_id, user_mappings, duplicate_mode: "ignore")
       messages = export["messages"] || []
+      total_importable = messages.count(&method(:importable_message?))
 
       # Find first importable message with a resolvable user to create the topic
       first_message = nil
@@ -340,34 +347,85 @@ module DiscourseDiscordimport
         break
       end
 
-      return [nil, 0, messages.count(&method(:importable_message?))] unless first_message
+      return [nil, 0, total_importable, 0] unless first_message
 
       content = format_content(first_message)
-      return [nil, 0, messages.count(&method(:importable_message?))] if content.blank?
+      return [nil, 0, total_importable, 0] if content.blank?
 
-      post = safe_create_post(
-        first_user,
-        title:       title,
-        raw:         content,
-        category:    category_id,
-        created_at:  DateTime.parse(first_message["timestamp"]),
-      )
-      return [nil, 0, messages.count(&method(:importable_message?))] unless post
+      discord_msg_id   = first_message["id"]
+      existing_field   = discord_msg_id ? PostCustomField.find_by(name: "discord_message_id", value: discord_msg_id) : nil
+      first_created    = 0
+      first_skipped    = 0
+      first_updated    = 0
+      topic            = nil
 
-      topic = post.topic
+      if existing_field
+        topic = existing_field.post&.topic
+        if duplicate_mode == "update" && topic
+          existing_field.post.update_columns(raw: content, cooked: PrettyText.cook(content))
+          first_updated = 1
+        else
+          first_skipped = 1
+        end
+      end
+
+      unless topic
+        post = safe_create_post(
+          first_user,
+          title:      title,
+          raw:        content,
+          category:   category_id,
+          created_at: DateTime.parse(first_message["timestamp"]),
+        )
+        return [nil, 0, total_importable, 0] unless post
+
+        PostCustomField.create!(post_id: post.id, name: "discord_message_id", value: discord_msg_id) if discord_msg_id
+        topic         = post.topic
+        first_created = 1
+      end
+
       remaining = messages.reject { |m| m["id"] == first_message["id"] }
-      created, skipped = import_messages(remaining, topic.id, user_mappings)
+      created, skipped, updated = import_messages(remaining, topic.id, user_mappings, duplicate_mode: duplicate_mode)
 
-      [topic, created + 1, skipped]
+      [topic, first_created + created, first_skipped + skipped, first_updated + updated]
     end
 
-    def self.import_messages(messages, topic_id, user_mappings)
+    def self.import_messages(messages, topic_id, user_mappings, duplicate_mode: "ignore")
       created = 0
       skipped = 0
+      updated = 0
 
       messages.each do |message|
         unless importable_message?(message)
           skipped += 1
+          next
+        end
+
+        discord_msg_id = message["id"]
+        existing_field = discord_msg_id ? PostCustomField.find_by(name: "discord_message_id", value: discord_msg_id) : nil
+
+        if existing_field
+          if duplicate_mode == "update"
+            user = resolve_user(message.dig("author", "id"), user_mappings)
+            unless user
+              skipped += 1
+              next
+            end
+            content = format_content(message)
+            if content.blank?
+              skipped += 1
+              next
+            end
+            post = existing_field.post
+            if post
+              post.update_columns(raw: content, cooked: PrettyText.cook(content))
+              updated += 1
+            else
+              skipped += 1
+            end
+          else
+            skipped += 1
+          end
           next
         end
 
@@ -391,13 +449,14 @@ module DiscourseDiscordimport
         )
 
         if post
+          PostCustomField.create!(post_id: post.id, name: "discord_message_id", value: discord_msg_id) if discord_msg_id
           created += 1
         else
           skipped += 1
         end
       end
 
-      [created, skipped]
+      [created, skipped, updated]
     end
 
     def self.safe_create_post(user, **opts)
