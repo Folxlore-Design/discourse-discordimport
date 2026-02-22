@@ -52,7 +52,9 @@ class DiscourseDiscordimport::ImportController < ::ApplicationController
       zip.each do |entry|
         next unless entry.file? && entry.name.end_with?(".json")
         data = JSON.parse(entry.get_input_stream.read)
-        exports << data if data["channel"] && data["messages"]
+        next unless data["channel"] && data["messages"]
+        data["_file_name"] = File.basename(entry.name)
+        exports << data
       end
     end
     raise "No valid DiscordChatExporter JSON files found in archive." if exports.empty?
@@ -68,7 +70,9 @@ class DiscourseDiscordimport::ImportController < ::ApplicationController
         tar.each do |entry|
           next unless entry.file? && entry.full_name.end_with?(".json")
           data = JSON.parse(entry.read)
-          exports << data if data["channel"] && data["messages"]
+          next unless data["channel"] && data["messages"]
+          data["_file_name"] = File.basename(entry.full_name)
+          exports << data
         end
       end
     end

@@ -241,33 +241,47 @@ export default class AdminDiscordImport extends Component {
 
   @action
   setChannelAction(channel, event) {
-    channel.config.action = event.target.value;
-    // Force re-render by reassigning channels
-    this.channels = [...this.channels];
+    this.channels = this.channels.map((ch) =>
+      ch === channel
+        ? { ...ch, config: { ...ch.config, action: event.target.value } }
+        : ch
+    );
   }
 
   @action
   setChannelTopicId(channel, event) {
-    channel.config.topic_id = parseInt(event.target.value, 10) || null;
-    this.channels = [...this.channels];
+    this.channels = this.channels.map((ch) =>
+      ch === channel
+        ? { ...ch, config: { ...ch.config, topic_id: parseInt(event.target.value, 10) || null } }
+        : ch
+    );
   }
 
   @action
   setChannelTitle(channel, event) {
-    channel.config.new_topic_title = event.target.value;
-    this.channels = [...this.channels];
+    this.channels = this.channels.map((ch) =>
+      ch === channel
+        ? { ...ch, config: { ...ch.config, new_topic_title: event.target.value } }
+        : ch
+    );
   }
 
   @action
   setChannelCategory(channel, event) {
-    channel.config.new_topic_category_id = parseInt(event.target.value, 10) || null;
-    this.channels = [...this.channels];
+    this.channels = this.channels.map((ch) =>
+      ch === channel
+        ? { ...ch, config: { ...ch.config, new_topic_category_id: parseInt(event.target.value, 10) || null } }
+        : ch
+    );
   }
 
   @action
   toggleSplitThreads(channel) {
-    channel.config.split_threads = !channel.config.split_threads;
-    this.channels = [...this.channels];
+    this.channels = this.channels.map((ch) =>
+      ch === channel
+        ? { ...ch, config: { ...ch.config, split_threads: !ch.config.split_threads } }
+        : ch
+    );
   }
 
   // ---------------------------------------------------------------------------
@@ -417,13 +431,10 @@ export default class AdminDiscordImport extends Component {
 
               <div class="discord-channel-config">
                 <label>Action</label>
-                <select
-                  value={{channel.config.action}}
-                  {{on "change" (fn this.setChannelAction channel)}}
-                >
-                  <option value="skip">Skip</option>
-                  <option value="existing">Add to existing topic</option>
-                  <option value="create">Create new topic</option>
+                <select {{on "change" (fn this.setChannelAction channel)}}>
+                  <option value="skip" selected={{eq channel.config.action "skip"}}>Skip</option>
+                  <option value="existing" selected={{eq channel.config.action "existing"}}>Add to existing topic</option>
+                  <option value="create" selected={{eq channel.config.action "create"}}>Create new topic</option>
                 </select>
 
                 {{#if (eq channel.config.action "existing")}}

@@ -2,8 +2,8 @@
 
 module DiscourseDiscordimport
   class DiscordImporter
-    CHANNEL_TYPES = %w[GuildTextChat].freeze
-    THREAD_TYPES  = %w[GuildPublicThread GuildPrivateThread].freeze
+    CHANNEL_TYPES = %w[GuildTextChat GuildNews GuildForum].freeze
+    THREAD_TYPES  = %w[GuildPublicThread GuildPrivateThread GuildNewsThread].freeze
 
     # ---------------------------------------------------------------------------
     # analyze(exports) → hash describing what's in the archive
@@ -11,7 +11,8 @@ module DiscourseDiscordimport
     # exports: array of parsed JSON hashes, one per file in the archive
     # ---------------------------------------------------------------------------
     def self.analyze(exports)
-      channels_by_id = {}
+      channels_by_id   = {}
+      channels_by_name = {}
       threads = []
 
       exports.each do |export|
@@ -23,28 +24,44 @@ module DiscourseDiscordimport
         importable, skipped = count_messages(messages)
 
         entry = {
-          channel_id:   ch["id"],
-          channel_name: ch["name"],
-          guild_name:   export.dig("guild", "name"),
+          channel_id:    ch["id"],
+          channel_name:  ch["name"],
+          guild_name:    export.dig("guild", "name"),
           message_count: importable,
           skipped_count: skipped,
         }
 
         if CHANNEL_TYPES.include?(type)
-          channels_by_id[ch["id"]] = entry.merge(threads: [])
+          channel_entry = entry.merge(threads: [])
+          channels_by_id[ch["id"]] = channel_entry
+          channels_by_name[ch["name"]] = channel_entry
         elsif THREAD_TYPES.include?(type)
-          threads << entry.merge(parent_channel_id: ch["categoryId"])
+          threads << entry.merge(
+            parent_channel_id: ch["categoryId"],
+            file_name:         export["_file_name"],
+          )
         end
       end
 
-      # Nest threads under their parent channels; orphans become top-level channels
+      # Nest threads under their parent channels.
+      # Primary match: categoryId == channel id.
+      # Fallback: parse parent channel name from DiscordChatExporter filename
+      #   format "Guild - ChannelName - ThreadName [id].json"
       threads.each do |thread|
         parent = channels_by_id[thread[:parent_channel_id]]
+
+        if parent.nil? && thread[:file_name]
+          parent_name = extract_parent_channel_name(thread[:file_name])
+          parent = channels_by_name[parent_name] if parent_name
+        end
+
         if parent
-          parent[:threads] << thread.except(:parent_channel_id)
+          parent[:threads] << thread.slice(:channel_id, :channel_name, :message_count, :skipped_count)
         else
           # Orphaned thread — treat as standalone channel with no threads
-          channels_by_id[thread[:channel_id]] = thread.except(:parent_channel_id).merge(threads: [])
+          channels_by_id[thread[:channel_id]] = thread.slice(
+            :channel_id, :channel_name, :guild_name, :message_count, :skipped_count
+          ).merge(threads: [])
         end
       end
 
@@ -82,10 +99,13 @@ module DiscourseDiscordimport
 
         channel_name = main_export.dig("channel", "name")
 
-        # Collect thread exports that belong to this channel
+        # Collect thread exports that belong to this channel.
+        # Primary match: categoryId == channel id.
+        # Fallback: filename second segment matches channel name.
         thread_exports = exports.select do |e|
-          THREAD_TYPES.include?(e.dig("channel", "type")) &&
-            e.dig("channel", "categoryId") == channel_id
+          next false unless THREAD_TYPES.include?(e.dig("channel", "type"))
+          e.dig("channel", "categoryId") == channel_id ||
+            extract_parent_channel_name(e["_file_name"]) == channel_name
         end
 
         # Resolve the primary topic
@@ -365,6 +385,17 @@ module DiscourseDiscordimport
     rescue => e
       Rails.logger.error("[DiscordImport] Failed to create post: #{e.message}")
       nil
+    end
+
+    # DiscordChatExporter filenames follow the pattern:
+    #   "Guild - ChannelName - ThreadName [id].json"
+    # The second segment (index 1 after splitting on " - ") is the parent channel name.
+    def self.extract_parent_channel_name(filename)
+      return nil if filename.nil?
+      base = File.basename(filename.to_s, ".json")
+      parts = base.split(" - ")
+      return nil unless parts.length >= 3
+      parts[1]
     end
   end
 end
