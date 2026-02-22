@@ -1,0 +1,343 @@
+.discord-import-page {
+  max-width: 800px;
+  margin: 0 auto;
+  padding: 1.5em;
+
+  h1 {
+    margin-bottom: 1.5em;
+  }
+
+  h2 {
+    margin: 1.5em 0 0.75em;
+    font-size: 1.1em;
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+    color: var(--primary-medium);
+  }
+}
+
+// ── Phase 1: Upload ────────────────────────────────────────────────────────
+
+.discord-import-upload {
+  display: flex;
+  flex-direction: column;
+  gap: 1em;
+  max-width: 400px;
+
+  label {
+    font-weight: bold;
+  }
+
+  input[type="file"] {
+    padding: 0.5em 0;
+  }
+}
+
+// ── Error message ──────────────────────────────────────────────────────────
+
+.discord-import-error {
+  color: var(--danger);
+  padding: 0.5em 0;
+}
+
+// ── Phase 2: Channels ──────────────────────────────────────────────────────
+
+.discord-import-channels {
+  border: 1px solid var(--primary-low);
+  border-radius: 6px;
+  overflow: hidden;
+}
+
+.discord-channel-block {
+  padding: 1em 1.25em;
+  border-bottom: 1px solid var(--primary-low);
+
+  &:last-child {
+    border-bottom: none;
+  }
+}
+
+.discord-channel-header {
+  display: flex;
+  align-items: baseline;
+  gap: 0.75em;
+  margin-bottom: 0.75em;
+
+  strong {
+    font-size: 1.05em;
+  }
+
+  .channel-meta {
+    color: var(--primary-medium);
+    font-size: 0.9em;
+  }
+}
+
+.discord-channel-config {
+  display: grid;
+  grid-template-columns: max-content 1fr;
+  align-items: center;
+  gap: 0.5em 1em;
+
+  label {
+    color: var(--primary-medium);
+    font-size: 0.9em;
+    white-space: nowrap;
+  }
+
+  select,
+  input[type="text"],
+  input[type="number"] {
+    width: 100%;
+    max-width: 360px;
+  }
+
+  .split-threads-label {
+    grid-column: 1 / -1;
+    display: flex;
+    align-items: center;
+    gap: 0.5em;
+    margin-top: 0.5em;
+    cursor: pointer;
+    color: var(--primary);
+    font-size: 0.95em;
+
+    input[type="checkbox"] {
+      width: auto;
+      cursor: pointer;
+    }
+  }
+
+  .split-threads-hint {
+    grid-column: 1 / -1;
+    margin: 0;
+    font-size: 0.85em;
+    color: var(--primary-medium);
+  }
+}
+
+// ── Phase 2: Users ─────────────────────────────────────────────────────────
+
+.discord-import-users {
+  margin-top: 1.5em;
+  border: 1px solid var(--primary-low);
+  border-radius: 6px;
+  overflow: hidden;
+}
+
+.users-table-header {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  padding: 0.5em 1.25em;
+  background: var(--primary-very-low);
+  font-size: 0.85em;
+  font-weight: bold;
+  color: var(--primary-medium);
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+
+.discord-user-row {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  align-items: start;
+  padding: 0.75em 1.25em;
+  border-bottom: 1px solid var(--primary-low);
+  gap: 1em;
+
+  &:last-child {
+    border-bottom: none;
+  }
+}
+
+.discord-user-info {
+  display: flex;
+  align-items: center;
+  gap: 0.75em;
+
+  .discord-avatar {
+    border-radius: 50%;
+    flex-shrink: 0;
+  }
+
+  strong {
+    display: block;
+    font-size: 0.95em;
+  }
+
+  .discord-username {
+    font-size: 0.82em;
+    color: var(--primary-medium);
+  }
+}
+
+.discourse-user-select {
+  position: relative;
+
+  .discourse-user-search-input {
+    width: 100%;
+  }
+
+  .searching {
+    position: absolute;
+    right: 0.5em;
+    top: 50%;
+    transform: translateY(-50%);
+    color: var(--primary-medium);
+    font-size: 0.85em;
+  }
+}
+
+.user-search-results {
+  position: absolute;
+  z-index: 100;
+  background: var(--secondary);
+  border: 1px solid var(--primary-low);
+  border-radius: 4px;
+  box-shadow: 0 4px 12px rgba(0, 0, 0, 0.12);
+  list-style: none;
+  margin: 2px 0 0;
+  padding: 0.25em 0;
+  min-width: 220px;
+  max-height: 240px;
+  overflow-y: auto;
+
+  li button {
+    display: block;
+    width: 100%;
+    text-align: left;
+    padding: 0.4em 0.8em;
+    background: none;
+    border: none;
+    cursor: pointer;
+    font-size: 0.9em;
+    color: var(--primary);
+
+    &:hover {
+      background: var(--primary-very-low);
+    }
+  }
+
+  .special-divider {
+    padding: 0.2em 0.8em;
+    color: var(--primary-low);
+    font-size: 0.75em;
+    pointer-events: none;
+  }
+}
+
+.quick-specials {
+  display: flex;
+  gap: 0.5em;
+  margin-top: 0.4em;
+
+  .btn-small {
+    padding: 0.2em 0.6em;
+    font-size: 0.82em;
+    border-radius: 3px;
+    border: 1px solid var(--primary-low);
+    background: none;
+    cursor: pointer;
+    color: var(--primary-medium);
+
+    &:hover,
+    &.active {
+      border-color: var(--tertiary);
+      color: var(--tertiary);
+      background: var(--tertiary-very-low);
+    }
+  }
+}
+
+// ── Confirm button ─────────────────────────────────────────────────────────
+
+.discord-import-confirm-btn {
+  margin-top: 1.5em;
+}
+
+// ── Progress ───────────────────────────────────────────────────────────────
+
+.discord-import-progress {
+  padding: 2em;
+  text-align: center;
+  color: var(--primary-medium);
+  font-size: 1.1em;
+}
+
+// ── Results ────────────────────────────────────────────────────────────────
+
+.discord-import-results {
+  .import-result-block {
+    padding: 0.75em 0;
+    border-bottom: 1px solid var(--primary-low);
+    display: flex;
+    align-items: baseline;
+    gap: 0.75em;
+    flex-wrap: wrap;
+
+    &:last-of-type {
+      border-bottom: none;
+    }
+
+    strong {
+      font-size: 1.05em;
+    }
+
+    span {
+      color: var(--primary-medium);
+      font-size: 0.9em;
+    }
+  }
+
+  .thread-results {
+    width: 100%;
+    margin: 0.25em 0 0 1em;
+    padding: 0;
+    list-style: disc inside;
+    font-size: 0.88em;
+    color: var(--primary-medium);
+  }
+}
+
+// ── Modal ──────────────────────────────────────────────────────────────────
+
+.discord-import-modal-overlay {
+  position: fixed;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.5);
+  z-index: 1000;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.discord-import-modal {
+  background: var(--secondary);
+  border-radius: 8px;
+  padding: 2em;
+  max-width: 480px;
+  width: 90%;
+  box-shadow: 0 8px 32px rgba(0, 0, 0, 0.2);
+
+  h2 {
+    margin-top: 0;
+    font-size: 1.2em;
+  }
+
+  ul {
+    margin: 0.5em 0 1em;
+    padding-left: 1.25em;
+
+    li {
+      margin-bottom: 0.4em;
+      font-size: 0.95em;
+    }
+  }
+
+  .modal-actions {
+    display: flex;
+    justify-content: flex-end;
+    gap: 0.75em;
+    margin-top: 1.5em;
+  }
+}

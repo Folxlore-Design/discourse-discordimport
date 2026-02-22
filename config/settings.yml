@@ -1,0 +1,4 @@
+plugins:
+  discordimport_enabled:
+    default: true
+    client: true
