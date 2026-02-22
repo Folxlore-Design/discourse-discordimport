@@ -261,6 +261,18 @@ module DiscourseDiscordimport
             staged: true,
             approved: true,
           )
+      elsif mapping.is_a?(Hash) && mapping["type"] == "new"
+        username = mapping["username"].to_s.strip
+        return nil if username.empty?
+        User.find_by(username: username) ||
+          User.create!(
+            username: username,
+            name: username,
+            email: "discord-#{discord_user_id}@imported.invalid",
+            password: SecureRandom.hex(20),
+            staged: true,
+            approved: true,
+          )
       else
         User.find_by(id: mapping.to_i)
       end

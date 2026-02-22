@@ -16,6 +16,23 @@ function csrfToken() {
 }
 
 // ---------------------------------------------------------------------------
+// Helper: sanitize a string into a valid Discourse username
+// Rules: a-z 0-9 . _ -  max 20 chars, must start/end alphanumeric,
+//        no consecutive specials.
+// ---------------------------------------------------------------------------
+function sanitizeUsername(name) {
+  let s = (name || "")
+    .toLowerCase()
+    .replace(/[^a-z0-9._-]/g, "_")   // invalid chars → _
+    .replace(/^[^a-z0-9]+/, "")       // strip leading non-alphanumeric
+    .replace(/[^a-z0-9]+$/, "")       // strip trailing non-alphanumeric
+    .replace(/[._-]{2,}/g, "_")       // collapse consecutive specials
+    .slice(0, 20);
+  if (s.length < 3) s = s.padEnd(3, "0");
+  return s || "user";
+}
+
+// ---------------------------------------------------------------------------
 // Helper: post FormData to a URL, return parsed JSON
 // ---------------------------------------------------------------------------
 async function postFormData(url, formData) {
@@ -45,19 +62,24 @@ class UserMappingRow extends Component {
   @tracked searchTerm = this.args.initial?.username ?? "";
   @tracked searchResults = [];
   @tracked searching = false;
-  @tracked selected = this.args.initial ?? null; // { id, username, name } | "omit" | "anonymous" | null
+  @tracked selected = this.args.initial ?? null; // { id, username, name } | { new: true, username } | "omit" | "anonymous" | null
 
-  get displayLabel() {
-    if (!this.selected) return "— select —";
-    if (this.selected === "omit") return "Omit";
-    if (this.selected === "anonymous") return "Anonymous";
-    return `@${this.selected.username}`;
+  get isNewUser() {
+    return this.selected?.new === true;
   }
 
   @action
   async onSearchInput(event) {
     const term = event.target.value;
     this.searchTerm = term;
+
+    // In new-user mode: update the pending username, don't search
+    if (this.isNewUser) {
+      this.selected = { new: true, username: term };
+      this.args.onChange(this.args.discordUser.discord_id, { type: "new", username: term });
+      return;
+    }
+
     if (term.length < 2) {
       this.searchResults = [];
       return;
@@ -89,6 +111,15 @@ class UserMappingRow extends Component {
     this.args.onChange(this.args.discordUser.discord_id, value);
   }
 
+  @action
+  selectNewUser() {
+    const username = sanitizeUsername(this.args.discordUser.name);
+    this.selected = { new: true, username };
+    this.searchTerm = username;
+    this.searchResults = [];
+    this.args.onChange(this.args.discordUser.discord_id, { type: "new", username });
+  }
+
   <template>
     <div class="discord-user-row">
       <div class="discord-user-info">
@@ -107,13 +138,16 @@ class UserMappingRow extends Component {
       <div class="discourse-user-select">
         <input
           type="text"
-          class="discourse-user-search-input"
-          placeholder="Search users…"
+          class="discourse-user-search-input {{if this.isNewUser "new-user-mode"}}"
+          placeholder={{if this.isNewUser "Username for new user…" "Search users…"}}
           value={{this.searchTerm}}
           {{on "input" this.onSearchInput}}
         />
         {{#if this.searching}}
           <span class="searching">…</span>
+        {{/if}}
+        {{#if this.isNewUser}}
+          <span class="new-user-badge">New staged user</span>
         {{/if}}
         {{#if this.searchResults.length}}
           <ul class="user-search-results">
@@ -152,6 +186,11 @@ class UserMappingRow extends Component {
               class="btn-small {{if (eq this.selected "anonymous") "active"}}"
               {{on "click" (fn this.selectSpecial "anonymous")}}
             >Anonymous</button>
+            <button
+              type="button"
+              class="btn-small {{if this.isNewUser "active"}}"
+              {{on "click" this.selectNewUser}}
+            >New</button>
           </div>
         {{/if}}
       </div>
