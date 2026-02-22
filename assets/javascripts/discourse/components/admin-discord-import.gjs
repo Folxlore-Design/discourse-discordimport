@@ -21,14 +21,21 @@ function csrfToken() {
 async function postFormData(url, formData) {
   const response = await fetch(url, {
     method: "POST",
-    headers: { "X-CSRF-Token": csrfToken() },
+    headers: {
+      "X-CSRF-Token": csrfToken(),
+      "Accept": "application/json",
+    },
     body: formData,
   });
-  const json = await response.json();
   if (!response.ok) {
-    throw new Error(json.error || `HTTP ${response.status}`);
+    const contentType = response.headers.get("content-type") || "";
+    if (contentType.includes("application/json")) {
+      const json = await response.json();
+      throw new Error(json.error || `HTTP ${response.status}`);
+    }
+    throw new Error(`HTTP ${response.status}: ${response.statusText}`);
   }
-  return json;
+  return response.json();
 }
 
 // ---------------------------------------------------------------------------
