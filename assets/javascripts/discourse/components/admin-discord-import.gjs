@@ -56,6 +56,70 @@ async function postFormData(url, formData) {
 }
 
 // ---------------------------------------------------------------------------
+// Sub-component: topic search picker
+// ---------------------------------------------------------------------------
+class TopicPickerInput extends Component {
+  @tracked searchTerm = "";
+  @tracked searchResults = [];
+  @tracked searching = false;
+  @tracked selectedTitle = null;
+
+  @action
+  async onSearchInput(event) {
+    const term = event.target.value;
+    this.searchTerm = term;
+    if (term.length < 2) {
+      this.searchResults = [];
+      return;
+    }
+    this.searching = true;
+    try {
+      const result = await ajax("/search.json", { data: { q: term } });
+      this.searchResults = result.topics ?? [];
+    } finally {
+      this.searching = false;
+    }
+  }
+
+  @action
+  selectTopic(topic) {
+    this.selectedTitle = topic.title;
+    this.searchTerm = topic.title;
+    this.searchResults = [];
+    this.args.onChange(topic.id);
+  }
+
+  <template>
+    <div class="topic-picker">
+      <input
+        type="text"
+        class="topic-search-input"
+        placeholder="Search for a topic…"
+        value={{this.searchTerm}}
+        {{on "input" this.onSearchInput}}
+      />
+      {{#if this.searching}}
+        <span class="searching">…</span>
+      {{/if}}
+      {{#if this.searchResults.length}}
+        <ul class="topic-search-results">
+          {{#each this.searchResults as |topic|}}
+            <li>
+              <button type="button" {{on "click" (fn this.selectTopic topic)}}>
+                {{topic.title}}
+              </button>
+            </li>
+          {{/each}}
+        </ul>
+      {{/if}}
+      {{#if this.selectedTitle}}
+        <span class="topic-selected-label">→ {{this.selectedTitle}}</span>
+      {{/if}}
+    </div>
+  </template>
+}
+
+// ---------------------------------------------------------------------------
 // Sub-component: user dropdown for each Discord user
 // ---------------------------------------------------------------------------
 class UserMappingRow extends Component {
@@ -288,10 +352,10 @@ export default class AdminDiscordImport extends Component {
   }
 
   @action
-  setChannelTopicId(channel, event) {
+  setChannelTopicId(channel, topicId) {
     this.channels = this.channels.map((ch) =>
       ch === channel
-        ? { ...ch, config: { ...ch.config, topic_id: parseInt(event.target.value, 10) || null } }
+        ? { ...ch, config: { ...ch.config, topic_id: topicId } }
         : ch
     );
   }
@@ -477,12 +541,9 @@ export default class AdminDiscordImport extends Component {
                 </select>
 
                 {{#if (eq channel.config.action "existing")}}
-                  <label>Topic ID</label>
-                  <input
-                    type="number"
-                    placeholder="Paste topic ID..."
-                    value={{channel.config.topic_id}}
-                    {{on "change" (fn this.setChannelTopicId channel)}}
+                  <label>Topic</label>
+                  <TopicPickerInput
+                    @onChange={{(fn this.setChannelTopicId channel)}}
                   />
                 {{/if}}
 

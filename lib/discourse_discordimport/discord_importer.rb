@@ -13,41 +13,53 @@ module DiscourseDiscordimport
     def self.analyze(exports)
       channels_by_id   = {}
       channels_by_name = {}
-      threads = []
+      pending_threads  = []
 
+      # Pass 1: identify top-level channels by type
       exports.each do |export|
         ch = export["channel"]
         next unless ch
+        next unless CHANNEL_TYPES.include?(ch["type"])
 
-        type = ch["type"]
         messages = export["messages"] || []
         importable, skipped = count_messages(messages)
-
         entry = {
           channel_id:    ch["id"],
           channel_name:  ch["name"],
           guild_name:    export.dig("guild", "name"),
           message_count: importable,
           skipped_count: skipped,
-        }
+        }.merge(threads: [])
+        channels_by_id[ch["id"]]    = entry
+        channels_by_name[ch["name"]] = entry
+      end
 
-        if CHANNEL_TYPES.include?(type)
-          channel_entry = entry.merge(threads: [])
-          channels_by_id[ch["id"]] = channel_entry
-          channels_by_name[ch["name"]] = channel_entry
-        elsif THREAD_TYPES.include?(type)
-          threads << entry.merge(
-            parent_channel_id: ch["categoryId"],
-            file_name:         export["_file_name"],
-          )
-        end
+      # Pass 2: everything else is a potential thread.
+      # Files with unknown channel.type (not in CHANNEL_TYPES) were silently dropped
+      # by the old single-pass approach — this catches them all.
+      exports.each do |export|
+        ch = export["channel"]
+        next unless ch
+        next if CHANNEL_TYPES.include?(ch["type"])
+
+        messages = export["messages"] || []
+        importable, skipped = count_messages(messages)
+        pending_threads << {
+          channel_id:        ch["id"],
+          channel_name:      ch["name"],
+          guild_name:        export.dig("guild", "name"),
+          message_count:     importable,
+          skipped_count:     skipped,
+          parent_channel_id: ch["categoryId"],
+          file_name:         export["_file_name"],
+        }
       end
 
       # Nest threads under their parent channels.
       # Primary match: categoryId == channel id.
       # Fallback: parse parent channel name from DiscordChatExporter filename
       #   format "Guild - ChannelName - ThreadName [id].json"
-      threads.each do |thread|
+      pending_threads.each do |thread|
         parent = channels_by_id[thread[:parent_channel_id]]
 
         if parent.nil? && thread[:file_name]
@@ -100,10 +112,11 @@ module DiscourseDiscordimport
         channel_name = main_export.dig("channel", "name")
 
         # Collect thread exports that belong to this channel.
+        # Anything that isn't a top-level channel type is a candidate thread.
         # Primary match: categoryId == channel id.
         # Fallback: filename second segment matches channel name.
         thread_exports = exports.select do |e|
-          next false unless THREAD_TYPES.include?(e.dig("channel", "type"))
+          next false if CHANNEL_TYPES.include?(e.dig("channel", "type"))
           e.dig("channel", "categoryId") == channel_id ||
             extract_parent_channel_name(e["_file_name"]) == channel_name
         end
