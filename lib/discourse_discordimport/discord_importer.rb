@@ -347,14 +347,15 @@ module DiscourseDiscordimport
         upload   = upload_attachment(att, user) if user
 
         if upload
-          if att["contentType"]&.start_with?("image/")
-            parts << "![#{filename}](#{upload.short_url})"
-          else
-            parts << "[#{filename}|attachment](#{upload.short_url})"
-          end
+          # UploadMarkdown checks filename extension for image detection and
+          # includes pixel dimensions when available — the correct Discourse format
+          parts << UploadMarkdown.new(upload).to_markdown
         else
-          # Fallback to original Discord CDN URL (may expire, but better than nothing)
-          if att["contentType"]&.start_with?("image/")
+          # Fallback to original Discord CDN URL (may expire, but better than nothing).
+          # Check contentType AND filename extension — some exports omit contentType.
+          is_image = att["contentType"]&.start_with?("image/") ||
+                     att["fileName"].to_s.match?(/\.(png|jpe?g|gif|webp|svg|bmp|tiff?)\z/i)
+          if is_image
             parts << "![#{filename}](#{att["url"]})"
           else
             parts << "[#{filename}](#{att["url"]})"
@@ -415,7 +416,7 @@ module DiscourseDiscordimport
       unless topic
         post = safe_create_post(
           first_user,
-          title:      title,
+          title:      sanitize_title(title),
           raw:        content,
           category:   category_id,
           created_at: DateTime.parse(first_message["timestamp"]),
@@ -512,6 +513,12 @@ module DiscourseDiscordimport
     rescue => e
       Rails.logger.error("[DiscordImport] Failed to create post: #{e.message}")
       nil
+    end
+
+    # Truncate and clean a title to fit Discourse's max topic title length.
+    # Discord thread names can be very long and contain arbitrary Unicode.
+    def self.sanitize_title(title)
+      title.to_s.strip.slice(0, SiteSetting.max_topic_title_length).presence || "Imported"
     end
 
     # DiscordChatExporter filenames follow the pattern:

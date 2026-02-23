@@ -330,8 +330,9 @@ export default class AdminDiscordImport extends Component {
   @tracked showConfirmModal = false;
   @tracked importError = null;
 
-  // Results
-  @tracked importResults = [];
+  // Import log: [{ channel_name, status: "pending"|"importing"|"done"|"error", result?, error? }]
+  @tracked importLog = [];
+  @tracked importDone = false;
 
   // ---------------------------------------------------------------------------
   // Phase 1 — file selection
@@ -489,30 +490,52 @@ export default class AdminDiscordImport extends Component {
     this.showConfirmModal = false;
     this.phase = "importing";
     this.importError = null;
+    this.importDone = false;
 
-    const channelConfigs = this.channelsToImport.map((ch) => ({
-      channel_id: ch.channel_id,
-      action: ch.config.action,
-      topic_id: ch.config.topic_id,
-      new_topic_title: ch.config.new_topic_title,
-      new_topic_category_id: ch.config.new_topic_category_id,
-      split_threads: ch.config.split_threads,
+    // Seed the log with all channels in "pending" state
+    this.importLog = this.channelsToImport.map((ch) => ({
+      channel_name: ch.channel_name,
+      status: "pending",
     }));
 
-    try {
-      const fd = new FormData();
-      fd.append("file", this.selectedFile);
-      fd.append("channel_configs", JSON.stringify(channelConfigs));
-      fd.append("user_mappings", JSON.stringify(this.userMappings));
-      fd.append("duplicate_mode", this.duplicateMode);
+    // Process one channel at a time so the log updates live after each
+    for (const channel of this.channelsToImport) {
+      this.importLog = this.importLog.map((e) =>
+        e.channel_name === channel.channel_name ? { ...e, status: "importing" } : e
+      );
 
-      const result = await postFormData("/discordimport/import", fd);
-      this.importResults = result.results ?? [];
-      this.phase = "results";
-    } catch (e) {
-      this.importError = e.message;
-      this.phase = "configure";
+      try {
+        const fd = new FormData();
+        fd.append("file", this.selectedFile);
+        fd.append("channel_configs", JSON.stringify([{
+          channel_id:            channel.channel_id,
+          action:                channel.config.action,
+          topic_id:              channel.config.topic_id,
+          new_topic_title:       channel.config.new_topic_title,
+          new_topic_category_id: channel.config.new_topic_category_id,
+          split_threads:         channel.config.split_threads,
+        }]));
+        fd.append("user_mappings", JSON.stringify(this.userMappings));
+        fd.append("duplicate_mode", this.duplicateMode);
+
+        const result = await postFormData("/discordimport/import", fd);
+        const channelResult = result.results?.[0];
+
+        this.importLog = this.importLog.map((e) =>
+          e.channel_name === channel.channel_name
+            ? { ...e, status: "done", result: channelResult }
+            : e
+        );
+      } catch (e) {
+        this.importLog = this.importLog.map((entry) =>
+          entry.channel_name === channel.channel_name
+            ? { ...entry, status: "error", error: e.message }
+            : entry
+        );
+      }
     }
+
+    this.importDone = true;
   }
 
   @action
@@ -522,7 +545,8 @@ export default class AdminDiscordImport extends Component {
     this.channels = [];
     this.users = [];
     this.userMappings = {};
-    this.importResults = [];
+    this.importLog = [];
+    this.importDone = false;
     this.analyzeError = null;
     this.importError = null;
   }
@@ -699,52 +723,44 @@ export default class AdminDiscordImport extends Component {
         />
       {{/if}}
 
-      {{!-- ===== PHASE: IMPORTING ===== --}}
+      {{!-- ===== PHASE: IMPORTING (live log + results) ===== --}}
       {{#if (eq this.phase "importing")}}
         <div class="discord-import-progress">
-          <p>Importing… please wait.</p>
-        </div>
-      {{/if}}
-
-      {{!-- ===== PHASE: RESULTS ===== --}}
-      {{#if (eq this.phase "results")}}
-        <div class="discord-import-results">
-          <h2>Import Complete</h2>
-          {{#each this.importResults as |result|}}
-            <div class="import-result-block">
-              <strong>#{{result.channel_name}}</strong>
-              <span>
-                {{result.posts_created}} posts imported
-                {{#if result.posts_updated}}
-                  · {{result.posts_updated}} updated
+          <h2>{{if this.importDone "Import Complete" "Importing…"}}</h2>
+          <ul class="import-log">
+            {{#each this.importLog as |entry|}}
+              <li class="import-log-entry status-{{entry.status}}">
+                <span class="log-channel">#{{entry.channel_name}}</span>
+                {{#if (eq entry.status "pending")}}
+                  <span class="log-status">waiting…</span>
                 {{/if}}
-                {{#if result.posts_skipped}}
-                  · {{result.posts_skipped}} skipped
+                {{#if (eq entry.status "importing")}}
+                  <span class="log-status">importing…</span>
                 {{/if}}
-              </span>
-              <a href={{result.topic_url}} target="_blank" rel="noopener noreferrer">
-                View Topic
-              </a>
-              {{#if result.thread_results.length}}
-                <ul class="thread-results">
-                  {{#each result.thread_results as |tr|}}
-                    <li>
-                      Thread: {{tr.thread_name}} —
-                      {{tr.posts_created}} posts
-                      {{#if tr.posts_updated}}· {{tr.posts_updated}} updated{{/if}}
-                      ·
-                      <a href={{tr.topic_url}} target="_blank" rel="noopener noreferrer">View</a>
-                    </li>
-                  {{/each}}
-                </ul>
-              {{/if}}
-            </div>
-          {{/each}}
-          <DButton
-            @action={{this.reset}}
-            @label="Import Another"
-            class="btn-default"
-          />
+                {{#if (eq entry.status "done")}}
+                  <span class="log-status">
+                    {{entry.result.posts_created}} imported
+                    {{#if entry.result.posts_skipped}}· {{entry.result.posts_skipped}} skipped{{/if}}
+                    {{#if entry.result.posts_updated}}· {{entry.result.posts_updated}} updated{{/if}}
+                    {{#if entry.result.thread_results.length}}· {{entry.result.thread_results.length}} threads{{/if}}
+                  </span>
+                  {{#if entry.result.topic_url}}
+                    <a href={{entry.result.topic_url}} target="_blank" rel="noopener noreferrer">View</a>
+                  {{/if}}
+                {{/if}}
+                {{#if (eq entry.status "error")}}
+                  <span class="log-error">{{entry.error}}</span>
+                {{/if}}
+              </li>
+            {{/each}}
+          </ul>
+          {{#if this.importDone}}
+            <DButton
+              @action={{this.reset}}
+              @translatedLabel="Import Another"
+              class="btn-default"
+            />
+          {{/if}}
         </div>
       {{/if}}
 
