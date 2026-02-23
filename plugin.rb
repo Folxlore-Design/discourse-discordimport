@@ -13,6 +13,7 @@ enabled_site_setting :discordimport_enabled
 
 after_initialize do
   register_post_custom_field_type("discord_message_id", :string)
+  register_post_custom_field_type("discord_thread_origin", :string)
 
   module ::DiscourseDiscordimport
     PLUGIN_NAME = "discourse-discordimport"

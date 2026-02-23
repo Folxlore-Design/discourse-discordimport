@@ -152,16 +152,50 @@ module DiscourseDiscordimport
         thread_results = []
 
         if split_threads
-          thread_exports.each do |te|
-            thread_name = te.dig("channel", "name")
-            category_id = topic.category_id
+          # Build a lookup map of thread exports by channel id for quick access
+          thread_exports_map = {}
+          thread_exports.each { |te| thread_exports_map[te.dig("channel", "id")] = te }
 
-            thread_topic, t_created, t_skipped, t_updated = create_topic_from_export(
-              te,
-              thread_name,
-              category_id,
-              user_mappings,
+          # Pass 1: handle threads that have a ThreadCreated marker in the main channel.
+          # These get the origin message as the first post, plus a back-link in the parent.
+          handled_thread_ids = {}
+          (main_export["messages"] || []).each do |msg|
+            next unless msg["type"] == "ThreadCreated"
+
+            thread_channel_id = msg.dig("reference", "channelId")
+            te = thread_exports_map[thread_channel_id]
+            next unless te
+
+            origin_msg = (main_export["messages"] || []).find { |m| m["id"] == thread_channel_id }
+
+            thread_topic, t_created, t_skipped, t_updated = import_thread_from_marker(
+              thread_export:  te,
+              origin_msg:     origin_msg,
+              parent_topic:   topic,
+              user_mappings:  user_mappings,
               duplicate_mode: duplicate_mode,
+            )
+            handled_thread_ids[thread_channel_id] = true
+            next unless thread_topic
+
+            thread_results << {
+              thread_name:   te.dig("channel", "name"),
+              topic_id:      thread_topic.id,
+              topic_url:     thread_topic.url,
+              posts_created: t_created,
+              posts_skipped: t_skipped,
+              posts_updated: t_updated,
+            }
+          end
+
+          # Pass 2: file-based fallback for thread exports with no ThreadCreated marker
+          # (e.g. the parent channel was not fully exported, or private threads).
+          thread_exports.each do |te|
+            next if handled_thread_ids.key?(te.dig("channel", "id"))
+
+            thread_name = te.dig("channel", "name")
+            thread_topic, t_created, t_skipped, t_updated = create_topic_from_export(
+              te, thread_name, topic.category_id, user_mappings, duplicate_mode: duplicate_mode,
             )
             next unless thread_topic
 
@@ -501,6 +535,98 @@ module DiscourseDiscordimport
       end
 
       [created, skipped, updated]
+    end
+
+    # Create a thread topic using the origin message from the parent channel as the first post.
+    # Appends a back-link to the origin post in the parent topic.
+    # Falls back to create_topic_from_export when origin_msg is unavailable or unusable.
+    def self.import_thread_from_marker(
+      thread_export:, origin_msg:, parent_topic:, user_mappings:, duplicate_mode:
+    )
+      thread_channel_id = thread_export.dig("channel", "id")
+      thread_name       = thread_export.dig("channel", "name")
+
+      # In Discord, the thread channel ID equals the origin message's snowflake ID.
+      # The origin message is imported as the thread's first post (not via import_messages),
+      # so exclude it from the thread message list to avoid a duplicate.
+      thread_messages = (thread_export["messages"] || []).reject { |m| m["id"] == thread_channel_id }
+
+      created = 0
+      skipped = 0
+      updated = 0
+      topic   = nil
+
+      # Dedup: if we already imported this thread's origin post, recover the topic.
+      existing_origin = PostCustomField.find_by(name: "discord_thread_origin", value: thread_channel_id)
+      if existing_origin
+        topic = existing_origin.post&.topic
+        return [nil, 0, 0, 0] unless topic
+      else
+        if origin_msg
+          origin_user = resolve_user(origin_msg.dig("author", "id"), user_mappings)
+
+          # Can't resolve user — fall back to file-based import (no special first post)
+          unless origin_user
+            return create_topic_from_export(
+              thread_export, thread_name, parent_topic.category_id, user_mappings,
+              duplicate_mode: duplicate_mode,
+            )
+          end
+
+          content = format_content(origin_msg, user: origin_user)
+          if content.blank?
+            return create_topic_from_export(
+              thread_export, thread_name, parent_topic.category_id, user_mappings,
+              duplicate_mode: duplicate_mode,
+            )
+          end
+
+          post = safe_create_post(
+            origin_user,
+            title:      sanitize_title(thread_name),
+            raw:        content,
+            category:   parent_topic.category_id,
+            created_at: DateTime.parse(origin_msg["timestamp"]),
+          )
+          return [nil, 0, thread_messages.count(&method(:importable_message?)), 0] unless post
+
+          # Use discord_thread_origin (not discord_message_id) so it doesn't conflict with
+          # the same message's post in the parent topic.
+          PostCustomField.create!(post_id: post.id, name: "discord_thread_origin", value: thread_channel_id)
+          topic   = post.topic
+          created = 1
+        else
+          # No origin message in the parent export — fall back to file-based import
+          return create_topic_from_export(
+            thread_export, thread_name, parent_topic.category_id, user_mappings,
+            duplicate_mode: duplicate_mode,
+          )
+        end
+      end
+
+      # Import remaining thread messages (each gets its own discord_message_id dedup)
+      t_created, t_skipped, t_updated = import_messages(
+        thread_messages, topic.id, user_mappings, duplicate_mode: duplicate_mode,
+      )
+      created += t_created
+      skipped += t_skipped
+      updated += t_updated
+
+      # Append a back-link to the origin post in the parent topic.
+      # The guard prevents duplicate links on re-import.
+      if origin_msg
+        origin_post_field = PostCustomField.find_by(name: "discord_message_id", value: origin_msg["id"])
+        origin_post = origin_post_field&.post
+        if origin_post && origin_post.topic_id == parent_topic.id
+          link_suffix = "*→ Thread: [#{thread_name}](#{topic.url})*"
+          unless origin_post.raw.include?(link_suffix)
+            new_raw = "#{origin_post.raw.rstrip}\n\n#{link_suffix}"
+            origin_post.update_columns(raw: new_raw, cooked: PrettyText.cook(new_raw))
+          end
+        end
+      end
+
+      [topic, created, skipped, updated]
     end
 
     def self.safe_create_post(user, **opts)
