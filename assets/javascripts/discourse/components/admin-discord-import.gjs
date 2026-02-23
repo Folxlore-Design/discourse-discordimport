@@ -4,7 +4,7 @@ import { action } from "@ember/object";
 import { service } from "@ember/service";
 import { fn, hash } from "@ember/helper";
 import { on } from "@ember/modifier";
-import { eq } from "truth-helpers";
+import { eq, or } from "truth-helpers";
 import { ajax } from "discourse/lib/ajax";
 import DButton from "discourse/components/d-button";
 
@@ -57,12 +57,51 @@ async function postFormData(url, formData) {
 
 // ---------------------------------------------------------------------------
 // Sub-component: topic search picker
+// Opens a dropdown of recent topics on focus; filters client-side or via
+// the search API when 2+ characters are typed.
 // ---------------------------------------------------------------------------
 class TopicPickerInput extends Component {
   // Initialize from parent-stored title so the field survives component recreation
   @tracked searchTerm = this.args.selectedTitle ?? "";
-  @tracked searchResults = [];
+  @tracked searchResults = [];   // results from /search.json (when typing)
+  @tracked allTopics = [];       // pre-loaded from /latest.json on first focus
   @tracked searching = false;
+  @tracked loadingTopics = false;
+  @tracked isOpen = false;
+
+  // What to show in the dropdown:
+  // - if searchResults present (user typed 2+ chars): show those
+  // - otherwise: client-side filter of allTopics by current searchTerm
+  get displayTopics() {
+    if (this.searchResults.length > 0) return this.searchResults;
+    if (!this.searchTerm) return this.allTopics;
+    const term = this.searchTerm.toLowerCase();
+    return this.allTopics.filter((t) => t.title.toLowerCase().includes(term));
+  }
+
+  @action
+  async onFocus() {
+    this.isOpen = true;
+    if (this.allTopics.length === 0 && !this.loadingTopics) {
+      this.loadingTopics = true;
+      try {
+        const result = await ajax("/latest.json");
+        this.allTopics = result.topic_list?.topics ?? [];
+      } catch (_e) {
+        // silently ignore — user can still type to search
+      } finally {
+        this.loadingTopics = false;
+      }
+    }
+  }
+
+  @action
+  onBlur() {
+    // Delay close so mousedown on a result fires before the dropdown disappears
+    setTimeout(() => {
+      this.isOpen = false;
+    }, 150);
+  }
 
   @action
   async onSearchInput(event) {
@@ -83,10 +122,11 @@ class TopicPickerInput extends Component {
 
   @action
   selectTopic(topic, event) {
-    // mousedown + preventDefault keeps input focused so blur doesn't fire first
+    // mousedown + preventDefault keeps focus so blur fires after selection
     event.preventDefault();
     this.searchTerm = topic.title;
     this.searchResults = [];
+    this.isOpen = false;
     this.args.onChange(topic.id, topic.title);
   }
 
@@ -95,23 +135,27 @@ class TopicPickerInput extends Component {
       <input
         type="text"
         class="topic-search-input {{if this.args.selectedTitle "has-selection"}}"
-        placeholder="Search for a topic…"
+        placeholder="Search or select a topic…"
         value={{this.searchTerm}}
         {{on "input" this.onSearchInput}}
+        {{on "focus" this.onFocus}}
+        {{on "blur" this.onBlur}}
       />
-      {{#if this.searching}}
+      {{#if (or this.searching this.loadingTopics)}}
         <span class="searching">…</span>
       {{/if}}
-      {{#if this.searchResults.length}}
-        <ul class="topic-search-results">
-          {{#each this.searchResults as |topic|}}
-            <li>
-              <button type="button" {{on "mousedown" (fn this.selectTopic topic)}}>
-                {{topic.title}}
-              </button>
-            </li>
-          {{/each}}
-        </ul>
+      {{#if this.isOpen}}
+        {{#if this.displayTopics.length}}
+          <ul class="topic-search-results">
+            {{#each this.displayTopics as |topic|}}
+              <li>
+                <button type="button" {{on "mousedown" (fn this.selectTopic topic)}}>
+                  {{topic.title}}
+                </button>
+              </li>
+            {{/each}}
+          </ul>
+        {{/if}}
       {{/if}}
     </div>
   </template>
@@ -524,34 +568,6 @@ export default class AdminDiscordImport extends Component {
           <p class="discord-import-error">{{this.importError}}</p>
         {{/if}}
 
-        {{!-- SECTION: Options --}}
-        <section class="discord-import-options">
-          <h2>Options</h2>
-          <fieldset class="duplicate-mode-fieldset">
-            <legend>Duplicate Posts</legend>
-            <label>
-              <input
-                type="radio"
-                name="duplicate-mode"
-                value="ignore"
-                checked={{eq this.duplicateMode "ignore"}}
-                {{on "change" this.setDuplicateMode}}
-              />
-              Ignore — skip posts already imported
-            </label>
-            <label>
-              <input
-                type="radio"
-                name="duplicate-mode"
-                value="update"
-                checked={{eq this.duplicateMode "update"}}
-                {{on "change" this.setDuplicateMode}}
-              />
-              Update — overwrite existing post content
-            </label>
-          </fieldset>
-        </section>
-
         {{!-- SECTION A: Channels --}}
         <section class="discord-import-channels">
           <h2>Channels</h2>
@@ -596,7 +612,10 @@ export default class AdminDiscordImport extends Component {
                   >
                     <option value="">— select category —</option>
                     {{#each this.site.categories as |cat|}}
-                      <option value={{cat.id}}>{{cat.name}}</option>
+                      <option
+                        value={{cat.id}}
+                        selected={{eq cat.id channel.config.new_topic_category_id}}
+                      >{{cat.name}}</option>
                     {{/each}}
                   </select>
                 {{/if}}
@@ -622,6 +641,30 @@ export default class AdminDiscordImport extends Component {
               </div>
             </div>
           {{/each}}
+
+          <fieldset class="duplicate-mode-fieldset">
+            <legend>Duplicate Posts</legend>
+            <label>
+              <input
+                type="radio"
+                name="duplicate-mode"
+                value="ignore"
+                checked={{eq this.duplicateMode "ignore"}}
+                {{on "change" this.setDuplicateMode}}
+              />
+              Ignore — skip posts already imported
+            </label>
+            <label>
+              <input
+                type="radio"
+                name="duplicate-mode"
+                value="update"
+                checked={{eq this.duplicateMode "update"}}
+                {{on "change" this.setDuplicateMode}}
+              />
+              Update — overwrite existing post content
+            </label>
+          </fieldset>
         </section>
 
         {{!-- SECTION B: Users --}}

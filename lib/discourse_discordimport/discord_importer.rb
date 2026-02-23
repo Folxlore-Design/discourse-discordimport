@@ -309,16 +309,56 @@ module DiscourseDiscordimport
       nil
     end
 
-    def self.format_content(message)
+    # Download a Discord CDN attachment and re-upload it to Discourse.
+    # Returns a Discourse Upload object, or nil if the download/upload fails.
+    # Callers should always handle nil and fall back to the original URL.
+    def self.upload_attachment(att, user)
+      url      = att["url"].to_s
+      filename = att["fileName"].presence || "attachment"
+      return nil unless url.start_with?("https://") && user
+
+      require "open-uri"
+      ext      = File.extname(filename).presence || ".bin"
+      tempfile = Tempfile.new(["discord-import-", ext])
+      tempfile.binmode
+
+      URI.open(url, "rb", read_timeout: 15, open_timeout: 10) do |remote|
+        tempfile.write(remote.read)
+      end
+      tempfile.rewind
+
+      upload = UploadCreator.new(tempfile, filename).create_for(user.id)
+      upload.persisted? ? upload : nil
+    rescue => e
+      Rails.logger.warn("[DiscordImport] Could not upload attachment #{filename}: #{e.message}")
+      nil
+    ensure
+      tempfile&.close
+      begin; tempfile&.unlink; rescue nil; end
+    end
+
+    def self.format_content(message, user: nil)
       parts = []
       content = message["content"].to_s.strip
       parts << content unless content.empty?
 
       (message["attachments"] || []).each do |att|
-        if att["contentType"]&.start_with?("image/")
-          parts << "![#{att["fileName"]}](#{att["url"]})"
+        filename = att["fileName"].presence || "attachment"
+        upload   = upload_attachment(att, user) if user
+
+        if upload
+          if att["contentType"]&.start_with?("image/")
+            parts << "![#{filename}](#{upload.short_url})"
+          else
+            parts << "[#{filename}|attachment](#{upload.short_url})"
+          end
         else
-          parts << "[#{att["fileName"]}](#{att["url"]})"
+          # Fallback to original Discord CDN URL (may expire, but better than nothing)
+          if att["contentType"]&.start_with?("image/")
+            parts << "![#{filename}](#{att["url"]})"
+          else
+            parts << "[#{filename}](#{att["url"]})"
+          end
         end
       end
 
@@ -352,7 +392,7 @@ module DiscourseDiscordimport
 
       return [nil, 0, total_importable, 0] unless first_message
 
-      content = format_content(first_message)
+      content = format_content(first_message, user: first_user)
       return [nil, 0, total_importable, 0] if content.blank?
 
       discord_msg_id   = first_message["id"]
@@ -414,7 +454,7 @@ module DiscourseDiscordimport
               skipped += 1
               next
             end
-            content = format_content(message)
+            content = format_content(message, user: user)
             if content.blank?
               skipped += 1
               next
@@ -438,7 +478,7 @@ module DiscourseDiscordimport
           next
         end
 
-        content = format_content(message)
+        content = format_content(message, user: user)
         if content.blank?
           skipped += 1
           next
