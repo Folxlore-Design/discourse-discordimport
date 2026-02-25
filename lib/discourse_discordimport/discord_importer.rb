@@ -404,6 +404,16 @@ module DiscourseDiscordimport
       filename = att["fileName"].presence || "attachment"
       return nil unless url.start_with?("https://") && user
 
+      # Discord CDN URLs contain an ex= hex Unix timestamp for the expiry time.
+      # Attempting to connect to an expired URL can stall for the full open_timeout
+      # (10s × many attachments = request timeout). Detect and skip immediately.
+      if (ex_match = url.match(/[?&]ex=([0-9a-f]+)/i))
+        if ex_match[1].to_i(16) < Time.now.to_i
+          log << "  WARN: CDN link expired for #{filename} (use a fresh export to include attachments)"
+          return nil
+        end
+      end
+
       require "open-uri"
       ext      = File.extname(filename).presence || ".bin"
       tempfile = Tempfile.new(["discord-import-", ext])
