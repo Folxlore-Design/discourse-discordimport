@@ -106,14 +106,21 @@ module DiscourseDiscordimport
       results = []
 
       channel_configs.each do |config|
+        log           = []
         channel_id    = config["channel_id"]
         action        = config["action"]
         split_threads = config["split_threads"] == true || config["split_threads"] == "true"
 
         main_export = exports_by_channel_id[channel_id]
-        next unless main_export
+        unless main_export
+          log << "ERROR: No export found for channel #{channel_id}"
+          results << { channel_name: channel_id, posts_created: 0, posts_skipped: 0,
+                       posts_updated: 0, thread_results: [], log_lines: log }
+          next
+        end
 
         channel_name = main_export.dig("channel", "name")
+        log << "=== ##{channel_name} ==="
 
         # Collect thread exports that belong to this channel.
         # Anything that isn't a top-level channel type is a candidate thread.
@@ -124,30 +131,46 @@ module DiscourseDiscordimport
           e.dig("channel", "categoryId") == channel_id ||
             extract_parent_channel_name(e["_file_name"]) == channel_name
         end
+        log << "Found #{thread_exports.size} thread export(s)" if thread_exports.any?
 
         # Resolve the primary topic
         topic, posts_created, posts_skipped, posts_updated =
           if action == "existing"
-            topic = Topic.find_by(id: config["topic_id"])
-            raise "Topic #{config["topic_id"]} not found" unless topic
+            t = Topic.find_by(id: config["topic_id"])
+            raise "Topic #{config["topic_id"]} not found" unless t
+            log << "Importing into existing topic: #{t.url}"
             created, skipped, updated = import_messages(
               main_export["messages"] || [],
-              topic.id,
+              t.id,
               user_mappings,
               duplicate_mode: duplicate_mode,
+              log: log,
             )
-            [topic, created, skipped, updated]
+            [t, created, skipped, updated]
           else
+            title = config["new_topic_title"] || main_export.dig("channel", "name")
+            log << "Creating new topic: \"#{sanitize_title(title)}\""
             create_topic_from_export(
               main_export,
-              config["new_topic_title"] || main_export.dig("channel", "name"),
+              title,
               config["new_topic_category_id"],
               user_mappings,
               duplicate_mode: duplicate_mode,
+              log: log,
             )
           end
 
-        next unless topic
+        unless topic
+          log << "ERROR: Could not create or find topic — skipping channel"
+          results << { channel_name: channel_name, posts_created: 0,
+                       posts_skipped: posts_skipped.to_i, posts_updated: 0,
+                       thread_results: [], log_lines: log }
+          next
+        end
+
+        log << "Topic: #{topic.url}"
+        log << "Messages: #{posts_created} imported, #{posts_skipped} skipped" \
+               "#{posts_updated > 0 ? ", #{posts_updated} updated" : ""}"
 
         thread_results = []
 
@@ -166,7 +189,14 @@ module DiscourseDiscordimport
             te = thread_exports_map[thread_channel_id]
             next unless te
 
-            origin_msg = (main_export["messages"] || []).find { |m| m["id"] == thread_channel_id }
+            # Only use a Default message as origin. Some ThreadCreated markers are
+            # self-referential (id == reference.channelId); those have no real origin message.
+            origin_msg = (main_export["messages"] || []).find do |m|
+              m["id"] == thread_channel_id && m["type"] == "Default"
+            end
+
+            thread_name = te.dig("channel", "name")
+            log << "Thread (marker): \"#{thread_name}\""
 
             thread_topic, t_created, t_skipped, t_updated = import_thread_from_marker(
               thread_export:  te,
@@ -174,18 +204,23 @@ module DiscourseDiscordimport
               parent_topic:   topic,
               user_mappings:  user_mappings,
               duplicate_mode: duplicate_mode,
+              log: log,
             )
             handled_thread_ids[thread_channel_id] = true
-            next unless thread_topic
 
-            thread_results << {
-              thread_name:   te.dig("channel", "name"),
-              topic_id:      thread_topic.id,
-              topic_url:     thread_topic.url,
-              posts_created: t_created,
-              posts_skipped: t_skipped,
-              posts_updated: t_updated,
-            }
+            if thread_topic
+              log << "  → #{thread_topic.url} (#{t_created} posts, #{t_skipped} skipped)"
+              thread_results << {
+                thread_name:   thread_name,
+                topic_id:      thread_topic.id,
+                topic_url:     thread_topic.url,
+                posts_created: t_created,
+                posts_skipped: t_skipped,
+                posts_updated: t_updated,
+              }
+            else
+              log << "  → ERROR: thread topic could not be created"
+            end
           end
 
           # Pass 2: file-based fallback for thread exports with no ThreadCreated marker
@@ -194,19 +229,26 @@ module DiscourseDiscordimport
             next if handled_thread_ids.key?(te.dig("channel", "id"))
 
             thread_name = te.dig("channel", "name")
-            thread_topic, t_created, t_skipped, t_updated = create_topic_from_export(
-              te, thread_name, topic.category_id, user_mappings, duplicate_mode: duplicate_mode,
-            )
-            next unless thread_topic
+            log << "Thread (file): \"#{thread_name}\""
 
-            thread_results << {
-              thread_name:   thread_name,
-              topic_id:      thread_topic.id,
-              topic_url:     thread_topic.url,
-              posts_created: t_created,
-              posts_skipped: t_skipped,
-              posts_updated: t_updated,
-            }
+            thread_topic, t_created, t_skipped, t_updated = create_topic_from_export(
+              te, thread_name, topic.category_id, user_mappings,
+              duplicate_mode: duplicate_mode, log: log,
+            )
+
+            if thread_topic
+              log << "  → #{thread_topic.url} (#{t_created} posts, #{t_skipped} skipped)"
+              thread_results << {
+                thread_name:   thread_name,
+                topic_id:      thread_topic.id,
+                topic_url:     thread_topic.url,
+                posts_created: t_created,
+                posts_skipped: t_skipped,
+                posts_updated: t_updated,
+              }
+            else
+              log << "  → ERROR: thread topic could not be created"
+            end
           end
         else
           # Merge threads into primary topic in timestamp order
@@ -217,6 +259,7 @@ module DiscourseDiscordimport
           sorted_threads.each do |te|
             thread_name = te.dig("channel", "name")
             messages    = te["messages"] || []
+            log << "Merging thread: \"#{thread_name}\" (#{messages.size} messages)"
 
             # Create separator post — use first resolvable user in the thread
             separator_user = first_resolvable_user(messages, user_mappings)
@@ -226,15 +269,22 @@ module DiscourseDiscordimport
                 topic_id: topic.id,
                 raw: "*--- Thread: \"#{thread_name}\" ---*",
                 created_at: DateTime.parse(messages.first["timestamp"]),
+                log: log,
               )
             end
 
-            t_created, t_skipped, t_updated = import_messages(messages, topic.id, user_mappings, duplicate_mode: duplicate_mode)
+            t_created, t_skipped, t_updated = import_messages(
+              messages, topic.id, user_mappings, duplicate_mode: duplicate_mode, log: log,
+            )
             posts_created += t_created
             posts_skipped += t_skipped
             posts_updated += t_updated
           end
         end
+
+        log << "=== Done: #{posts_created} imported, #{posts_skipped} skipped" \
+               "#{posts_updated > 0 ? ", #{posts_updated} updated" : ""}" \
+               "#{thread_results.any? ? ", #{thread_results.size} thread(s)" : ""} ==="
 
         results << {
           channel_name:   channel_name,
@@ -244,6 +294,7 @@ module DiscourseDiscordimport
           posts_skipped:  posts_skipped,
           posts_updated:  posts_updated,
           thread_results: thread_results,
+          log_lines:      log,
         }
       end
 
@@ -267,9 +318,11 @@ module DiscourseDiscordimport
       [importable, skipped]
     end
 
+    # Default = regular message; Reply = message that quotes another message.
+    # Both are user-authored content and should be imported.
     def self.importable_message?(message)
       return false if message.dig("author", "isBot")
-      message["type"] == "Default"
+      %w[Default Reply].include?(message["type"])
     end
 
     def self.collect_users(exports)
@@ -346,7 +399,7 @@ module DiscourseDiscordimport
     # Download a Discord CDN attachment and re-upload it to Discourse.
     # Returns a Discourse Upload object, or nil if the download/upload fails.
     # Callers should always handle nil and fall back to the original URL.
-    def self.upload_attachment(att, user)
+    def self.upload_attachment(att, user, log: [])
       url      = att["url"].to_s
       filename = att["fileName"].presence || "attachment"
       return nil unless url.start_with?("https://") && user
@@ -362,8 +415,15 @@ module DiscourseDiscordimport
       tempfile.rewind
 
       upload = UploadCreator.new(tempfile, filename).create_for(user.id)
-      upload.persisted? ? upload : nil
+      if upload.persisted?
+        upload
+      else
+        log << "  WARN: Upload failed for #{filename}: #{upload.errors.full_messages.join(", ")}"
+        Rails.logger.warn("[DiscordImport] Upload failed for #{filename}: #{upload.errors.full_messages.join(", ")}")
+        nil
+      end
     rescue => e
+      log << "  WARN: Could not upload #{filename}: #{e.message}"
       Rails.logger.warn("[DiscordImport] Could not upload attachment #{filename}: #{e.message}")
       nil
     ensure
@@ -371,14 +431,14 @@ module DiscourseDiscordimport
       begin; tempfile&.unlink; rescue nil; end
     end
 
-    def self.format_content(message, user: nil)
+    def self.format_content(message, user: nil, log: [])
       parts = []
       content = message["content"].to_s.strip
       parts << content unless content.empty?
 
       (message["attachments"] || []).each do |att|
         filename = att["fileName"].presence || "attachment"
-        upload   = upload_attachment(att, user) if user
+        upload   = upload_attachment(att, user, log: log) if user
 
         if upload
           # UploadMarkdown checks filename extension for image detection and
@@ -409,7 +469,7 @@ module DiscourseDiscordimport
       parts.join("\n\n")
     end
 
-    def self.create_topic_from_export(export, title, category_id, user_mappings, duplicate_mode: "ignore")
+    def self.create_topic_from_export(export, title, category_id, user_mappings, duplicate_mode: "ignore", log: [])
       messages = export["messages"] || []
       total_importable = messages.count(&method(:importable_message?))
 
@@ -425,10 +485,16 @@ module DiscourseDiscordimport
         break
       end
 
-      return [nil, 0, total_importable, 0] unless first_message
+      unless first_message
+        log << "  WARN: No importable message with resolvable user — skipping"
+        return [nil, 0, total_importable, 0]
+      end
 
-      content = format_content(first_message, user: first_user)
-      return [nil, 0, total_importable, 0] if content.blank?
+      content = format_content(first_message, user: first_user, log: log)
+      if content.blank?
+        log << "  WARN: First message content is blank — skipping"
+        return [nil, 0, total_importable, 0]
+      end
 
       discord_msg_id   = first_message["id"]
       existing_field   = discord_msg_id ? PostCustomField.find_by(name: "discord_message_id", value: discord_msg_id) : nil
@@ -444,6 +510,7 @@ module DiscourseDiscordimport
           first_updated = 1
         else
           first_skipped = 1
+          log << "  Duplicate: first post already imported (#{duplicate_mode == "ignore" ? "skipping" : "recovering topic"})"
         end
       end
 
@@ -454,6 +521,7 @@ module DiscourseDiscordimport
           raw:        content,
           category:   category_id,
           created_at: DateTime.parse(first_message["timestamp"]),
+          log:        log,
         )
         return [nil, 0, total_importable, 0] unless post
 
@@ -463,12 +531,14 @@ module DiscourseDiscordimport
       end
 
       remaining = messages.reject { |m| m["id"] == first_message["id"] }
-      created, skipped, updated = import_messages(remaining, topic.id, user_mappings, duplicate_mode: duplicate_mode)
+      created, skipped, updated = import_messages(
+        remaining, topic.id, user_mappings, duplicate_mode: duplicate_mode, log: log,
+      )
 
       [topic, first_created + created, first_skipped + skipped, first_updated + updated]
     end
 
-    def self.import_messages(messages, topic_id, user_mappings, duplicate_mode: "ignore")
+    def self.import_messages(messages, topic_id, user_mappings, duplicate_mode: "ignore", log: [])
       created = 0
       skipped = 0
       updated = 0
@@ -489,7 +559,7 @@ module DiscourseDiscordimport
               skipped += 1
               next
             end
-            content = format_content(message, user: user)
+            content = format_content(message, user: user, log: log)
             if content.blank?
               skipped += 1
               next
@@ -513,7 +583,7 @@ module DiscourseDiscordimport
           next
         end
 
-        content = format_content(message, user: user)
+        content = format_content(message, user: user, log: log)
         if content.blank?
           skipped += 1
           next
@@ -524,6 +594,7 @@ module DiscourseDiscordimport
           topic_id:   topic_id,
           raw:        content,
           created_at: DateTime.parse(message["timestamp"]),
+          log:        log,
         )
 
         if post
@@ -541,7 +612,7 @@ module DiscourseDiscordimport
     # Appends a back-link to the origin post in the parent topic.
     # Falls back to create_topic_from_export when origin_msg is unavailable or unusable.
     def self.import_thread_from_marker(
-      thread_export:, origin_msg:, parent_topic:, user_mappings:, duplicate_mode:
+      thread_export:, origin_msg:, parent_topic:, user_mappings:, duplicate_mode:, log: []
     )
       thread_channel_id = thread_export.dig("channel", "id")
       thread_name       = thread_export.dig("channel", "name")
@@ -560,24 +631,34 @@ module DiscourseDiscordimport
       existing_origin = PostCustomField.find_by(name: "discord_thread_origin", value: thread_channel_id)
       if existing_origin
         topic = existing_origin.post&.topic
-        return [nil, 0, 0, 0] unless topic
+        if topic
+          log << "  Dedup: thread already imported → #{topic.url}"
+        else
+          log << "  Dedup: thread record found but topic is gone — skipping"
+          return [nil, 0, 0, 0]
+        end
       else
         if origin_msg
+          preview = origin_msg["content"].to_s.slice(0, 60).gsub(/\s+/, " ").strip
+          log << "  Origin: \"#{preview}#{origin_msg["content"].to_s.length > 60 ? "…" : ""}\""
+
           origin_user = resolve_user(origin_msg.dig("author", "id"), user_mappings)
 
           # Can't resolve user — fall back to file-based import (no special first post)
           unless origin_user
+            log << "  WARN: Origin user unmapped — falling back to file-based import"
             return create_topic_from_export(
               thread_export, thread_name, parent_topic.category_id, user_mappings,
-              duplicate_mode: duplicate_mode,
+              duplicate_mode: duplicate_mode, log: log,
             )
           end
 
-          content = format_content(origin_msg, user: origin_user)
+          content = format_content(origin_msg, user: origin_user, log: log)
           if content.blank?
+            log << "  WARN: Origin message content is blank — falling back to file-based import"
             return create_topic_from_export(
               thread_export, thread_name, parent_topic.category_id, user_mappings,
-              duplicate_mode: duplicate_mode,
+              duplicate_mode: duplicate_mode, log: log,
             )
           end
 
@@ -587,6 +668,7 @@ module DiscourseDiscordimport
             raw:        content,
             category:   parent_topic.category_id,
             created_at: DateTime.parse(origin_msg["timestamp"]),
+            log:        log,
           )
           return [nil, 0, thread_messages.count(&method(:importable_message?)), 0] unless post
 
@@ -596,17 +678,18 @@ module DiscourseDiscordimport
           topic   = post.topic
           created = 1
         else
-          # No origin message in the parent export — fall back to file-based import
+          # No Default origin message — fall back to file-based import
+          log << "  No origin message — using file-based import"
           return create_topic_from_export(
             thread_export, thread_name, parent_topic.category_id, user_mappings,
-            duplicate_mode: duplicate_mode,
+            duplicate_mode: duplicate_mode, log: log,
           )
         end
       end
 
       # Import remaining thread messages (each gets its own discord_message_id dedup)
       t_created, t_skipped, t_updated = import_messages(
-        thread_messages, topic.id, user_mappings, duplicate_mode: duplicate_mode,
+        thread_messages, topic.id, user_mappings, duplicate_mode: duplicate_mode, log: log,
       )
       created += t_created
       skipped += t_skipped
@@ -622,14 +705,19 @@ module DiscourseDiscordimport
           unless origin_post.raw.include?(link_suffix)
             new_raw = "#{origin_post.raw.rstrip}\n\n#{link_suffix}"
             origin_post.update_columns(raw: new_raw, cooked: PrettyText.cook(new_raw))
+            log << "  Back-link added to origin post"
+          else
+            log << "  Back-link already present"
           end
+        else
+          log << "  WARN: Could not find origin post in parent topic for back-link"
         end
       end
 
       [topic, created, skipped, updated]
     end
 
-    def self.safe_create_post(user, **opts)
+    def self.safe_create_post(user, log: [], **opts)
       PostCreator.create!(
         user,
         **opts,
@@ -637,6 +725,7 @@ module DiscourseDiscordimport
         skip_guardian:    true,
       )
     rescue => e
+      log << "  ERROR: Failed to create post: #{e.message}"
       Rails.logger.error("[DiscordImport] Failed to create post: #{e.message}")
       nil
     end

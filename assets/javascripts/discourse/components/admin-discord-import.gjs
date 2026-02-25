@@ -330,8 +330,10 @@ export default class AdminDiscordImport extends Component {
   @tracked showConfirmModal = false;
   @tracked importError = null;
 
-  // Import log: [{ channel_name, status: "pending"|"importing"|"done"|"error", result?, error? }]
-  @tracked importLog = [];
+  // Terminal log lines — flat string array, appended as each channel completes
+  @tracked logLines = [];
+  // Per-channel result summary for the links at the bottom
+  @tracked importResults = [];
   @tracked importDone = false;
 
   // ---------------------------------------------------------------------------
@@ -485,24 +487,37 @@ export default class AdminDiscordImport extends Component {
   // Import
   // ---------------------------------------------------------------------------
 
+  get logText() {
+    return this.logLines.join("\n");
+  }
+
+  _appendLog(...lines) {
+    this.logLines = [...this.logLines, ...lines];
+    // Scroll the terminal to the bottom after the next paint
+    setTimeout(() => {
+      const el = document.getElementById("discord-import-log");
+      if (el) el.scrollTop = el.scrollHeight;
+    }, 30);
+  }
+
   @action
   async runImport() {
     this.showConfirmModal = false;
     this.phase = "importing";
     this.importError = null;
     this.importDone = false;
-
-    // Seed the log with all channels in "pending" state
-    this.importLog = this.channelsToImport.map((ch) => ({
+    this.logLines = [];
+    this.importResults = this.channelsToImport.map((ch) => ({
       channel_name: ch.channel_name,
       status: "pending",
     }));
 
     // Process one channel at a time so the log updates live after each
     for (const channel of this.channelsToImport) {
-      this.importLog = this.importLog.map((e) =>
-        e.channel_name === channel.channel_name ? { ...e, status: "importing" } : e
+      this.importResults = this.importResults.map((r) =>
+        r.channel_name === channel.channel_name ? { ...r, status: "importing" } : r
       );
+      this._appendLog(`[${channel.channel_name}] Starting…`);
 
       try {
         const fd = new FormData();
@@ -521,20 +536,28 @@ export default class AdminDiscordImport extends Component {
         const result = await postFormData("/discordimport/import", fd);
         const channelResult = result.results?.[0];
 
-        this.importLog = this.importLog.map((e) =>
-          e.channel_name === channel.channel_name
-            ? { ...e, status: "done", result: channelResult }
-            : e
+        // Append backend log lines
+        if (channelResult?.log_lines?.length) {
+          this._appendLog(...channelResult.log_lines);
+        }
+
+        this.importResults = this.importResults.map((r) =>
+          r.channel_name === channel.channel_name
+            ? { ...r, status: "done", topic_url: channelResult?.topic_url,
+                thread_results: channelResult?.thread_results ?? [] }
+            : r
         );
       } catch (e) {
-        this.importLog = this.importLog.map((entry) =>
-          entry.channel_name === channel.channel_name
-            ? { ...entry, status: "error", error: e.message }
-            : entry
+        this._appendLog(`ERROR [${channel.channel_name}]: ${e.message}`);
+        this.importResults = this.importResults.map((r) =>
+          r.channel_name === channel.channel_name
+            ? { ...r, status: "error", error: e.message }
+            : r
         );
       }
     }
 
+    this._appendLog("", "--- Import complete ---");
     this.importDone = true;
   }
 
@@ -545,7 +568,8 @@ export default class AdminDiscordImport extends Component {
     this.channels = [];
     this.users = [];
     this.userMappings = {};
-    this.importLog = [];
+    this.logLines = [];
+    this.importResults = [];
     this.importDone = false;
     this.analyzeError = null;
     this.importError = null;
@@ -723,38 +747,38 @@ export default class AdminDiscordImport extends Component {
         />
       {{/if}}
 
-      {{!-- ===== PHASE: IMPORTING (live log + results) ===== --}}
+      {{!-- ===== PHASE: IMPORTING (terminal log + result links) ===== --}}
       {{#if (eq this.phase "importing")}}
         <div class="discord-import-progress">
           <h2>{{if this.importDone "Import Complete" "Importing…"}}</h2>
-          <ul class="import-log">
-            {{#each this.importLog as |entry|}}
-              <li class="import-log-entry status-{{entry.status}}">
-                <span class="log-channel">#{{entry.channel_name}}</span>
-                {{#if (eq entry.status "pending")}}
-                  <span class="log-status">waiting…</span>
-                {{/if}}
-                {{#if (eq entry.status "importing")}}
-                  <span class="log-status">importing…</span>
-                {{/if}}
-                {{#if (eq entry.status "done")}}
-                  <span class="log-status">
-                    {{entry.result.posts_created}} imported
-                    {{#if entry.result.posts_skipped}}· {{entry.result.posts_skipped}} skipped{{/if}}
-                    {{#if entry.result.posts_updated}}· {{entry.result.posts_updated}} updated{{/if}}
-                    {{#if entry.result.thread_results.length}}· {{entry.result.thread_results.length}} threads{{/if}}
-                  </span>
-                  {{#if entry.result.topic_url}}
-                    <a href={{entry.result.topic_url}} target="_blank" rel="noopener noreferrer">View</a>
-                  {{/if}}
-                {{/if}}
-                {{#if (eq entry.status "error")}}
-                  <span class="log-error">{{entry.error}}</span>
-                {{/if}}
-              </li>
-            {{/each}}
-          </ul>
+
+          <pre id="discord-import-log" class="discord-import-log">{{this.logText}}</pre>
+
+          {{!-- Per-channel result links, shown once done --}}
           {{#if this.importDone}}
+            <ul class="import-results">
+              {{#each this.importResults as |r|}}
+                <li class="import-result-{{r.status}}">
+                  <span class="result-channel">#{{r.channel_name}}</span>
+                  {{#if (eq r.status "done")}}
+                    {{#if r.topic_url}}
+                      <a href={{r.topic_url}} target="_blank" rel="noopener noreferrer">View topic</a>
+                    {{/if}}
+                    {{#if r.thread_results.length}}
+                      <span class="result-threads">
+                        · {{r.thread_results.length}} thread(s):
+                        {{#each r.thread_results as |tr|}}
+                          <a href={{tr.topic_url}} target="_blank" rel="noopener noreferrer">{{tr.thread_name}}</a>
+                        {{/each}}
+                      </span>
+                    {{/if}}
+                  {{/if}}
+                  {{#if (eq r.status "error")}}
+                    <span class="result-error">error</span>
+                  {{/if}}
+                </li>
+              {{/each}}
+            </ul>
             <DButton
               @action={{this.reset}}
               @translatedLabel="Import Another"
