@@ -644,10 +644,14 @@ module DiscourseDiscordimport
         if topic
           log << "  Dedup: thread already imported → #{topic.url}"
         else
-          log << "  Dedup: thread record found but topic is gone — skipping"
-          return [nil, 0, 0, 0]
+          # The topic was deleted after import (e.g. a failed run was cleaned up).
+          # Remove the stale field so we can reimport cleanly.
+          log << "  Dedup: stale thread record (topic deleted) — reimporting"
+          existing_origin.destroy
         end
-      else
+      end
+
+      unless topic
         if origin_msg
           preview = origin_msg["content"].to_s.slice(0, 60).gsub(/\s+/, " ").strip
           log << "  Origin: \"#{preview}#{origin_msg["content"].to_s.length > 60 ? "…" : ""}\""
