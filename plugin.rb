@@ -3,8 +3,8 @@
 # name: discourse-discordimport
 # about: Import Discord chat exports (DiscordChatExporter JSON archives) into Discourse topics
 # version: 0.1.0
-# authors: coven.folxlore.net
-# url: https://github.com/branwyn/discourse-discordimport
+# authors: Branwyn Tylwyth
+# url: https://github.com/Folxlore-Design/discourse-discordimport
 # component: false
 
 register_asset "stylesheets/discord-import.scss"
