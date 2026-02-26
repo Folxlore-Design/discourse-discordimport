@@ -514,13 +514,20 @@ module DiscourseDiscordimport
       topic            = nil
 
       if existing_field
-        topic = existing_field.post&.topic
-        if duplicate_mode == "update" && topic
-          existing_field.post.update_columns(raw: content, cooked: PrettyText.cook(content))
-          first_updated = 1
+        candidate = existing_field.post&.topic
+        if candidate && !candidate.trashed?
+          topic = candidate
+          if duplicate_mode == "update"
+            existing_field.post.update_columns(raw: content, cooked: PrettyText.cook(content))
+            first_updated = 1
+          else
+            first_skipped = 1
+            log << "  Duplicate: first post already imported (#{duplicate_mode == "ignore" ? "skipping" : "recovering topic"})"
+          end
         else
-          first_skipped = 1
-          log << "  Duplicate: first post already imported (#{duplicate_mode == "ignore" ? "skipping" : "recovering topic"})"
+          # Topic was deleted — discard stale field and create fresh
+          log << "  Duplicate: first post exists but topic was deleted — reimporting"
+          existing_field.destroy
         end
       end
 
@@ -554,63 +561,67 @@ module DiscourseDiscordimport
       updated = 0
 
       messages.each do |message|
-        unless importable_message?(message)
-          skipped += 1
-          next
-        end
+        begin
+          unless importable_message?(message)
+            skipped += 1
+            next
+          end
 
-        discord_msg_id = message["id"]
-        existing_field = discord_msg_id ? PostCustomField.find_by(name: "discord_message_id", value: discord_msg_id) : nil
+          discord_msg_id = message["id"]
+          existing_field = discord_msg_id ? PostCustomField.find_by(name: "discord_message_id", value: discord_msg_id) : nil
 
-        if existing_field
-          if duplicate_mode == "update"
-            user = resolve_user(message.dig("author", "id"), user_mappings)
-            unless user
-              skipped += 1
+          if existing_field
+            # Only treat as a genuine duplicate if the existing post lives on THIS topic.
+            # If it's on a different (possibly deleted) topic, the field is stale — discard
+            # it and import fresh so the post appears in the correct topic.
+            if existing_field.post&.topic_id == topic_id
+              if duplicate_mode == "update"
+                user = resolve_user(message.dig("author", "id"), user_mappings)
+                content = user ? format_content(message, user: user, log: log) : nil
+                if content.present?
+                  existing_field.post.update_columns(raw: content, cooked: PrettyText.cook(content))
+                  updated += 1
+                else
+                  skipped += 1
+                end
+              else
+                skipped += 1
+              end
               next
-            end
-            content = format_content(message, user: user, log: log)
-            if content.blank?
-              skipped += 1
-              next
-            end
-            post = existing_field.post
-            if post
-              post.update_columns(raw: content, cooked: PrettyText.cook(content))
-              updated += 1
             else
-              skipped += 1
+              existing_field.destroy
             end
+          end
+
+          user = resolve_user(message.dig("author", "id"), user_mappings)
+          unless user
+            skipped += 1
+            next
+          end
+
+          content = format_content(message, user: user, log: log)
+          if content.blank?
+            skipped += 1
+            next
+          end
+
+          post = safe_create_post(
+            user,
+            topic_id:   topic_id,
+            raw:        content,
+            created_at: DateTime.parse(message["timestamp"]),
+            log:        log,
+          )
+
+          if post
+            PostCustomField.create!(post_id: post.id, name: "discord_message_id", value: discord_msg_id) if discord_msg_id
+            created += 1
           else
             skipped += 1
           end
-          next
-        end
-
-        user = resolve_user(message.dig("author", "id"), user_mappings)
-        unless user
-          skipped += 1
-          next
-        end
-
-        content = format_content(message, user: user, log: log)
-        if content.blank?
-          skipped += 1
-          next
-        end
-
-        post = safe_create_post(
-          user,
-          topic_id:   topic_id,
-          raw:        content,
-          created_at: DateTime.parse(message["timestamp"]),
-          log:        log,
-        )
-
-        if post
-          PostCustomField.create!(post_id: post.id, name: "discord_message_id", value: discord_msg_id) if discord_msg_id
-          created += 1
-        else
+        rescue => e
+          log << "  ERROR: message #{message["id"]}: #{e.class}: #{e.message}"
+          Rails.logger.error("[DiscordImport] Exception on message #{message["id"]}: #{e.class}: #{e.message}\n#{Array(e.backtrace).first(5).join("\n")}")
           skipped += 1
         end
       end
@@ -640,11 +651,12 @@ module DiscourseDiscordimport
       # Dedup: if we already imported this thread's origin post, recover the topic.
       existing_origin = PostCustomField.find_by(name: "discord_thread_origin", value: thread_channel_id)
       if existing_origin
-        topic = existing_origin.post&.topic
-        if topic
+        candidate = existing_origin.post&.topic
+        if candidate && !candidate.trashed?
+          topic = candidate
           log << "  Dedup: thread already imported → #{topic.url}"
         else
-          # The topic was deleted after import (e.g. a failed run was cleaned up).
+          # The topic is gone or soft-deleted (e.g. cleaned up after a failed run).
           # Remove the stale field so we can reimport cleanly.
           log << "  Dedup: stale thread record (topic deleted) — reimporting"
           existing_origin.destroy

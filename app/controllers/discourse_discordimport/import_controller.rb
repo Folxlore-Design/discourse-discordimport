@@ -31,7 +31,7 @@ class DiscourseDiscordimport::ImportController < ::ApplicationController
     render json: result
   rescue => e
     Rails.logger.error("[DiscordImport] Import failed: #{e.class}: #{e.message}\n#{Array(e.backtrace).first(10).join("\n")}")
-    render json: { error: e.message }, status: 422
+    render json: { error: "#{e.class}: #{e.message}" }, status: 422
   end
 
   private
