@@ -7,15 +7,12 @@ module DiscourseDiscordimport
 
     # ---------------------------------------------------------------------------
     # analyze(exports) → hash describing what's in the archive
-    #
-    # exports: array of parsed JSON hashes, one per file in the archive
     # ---------------------------------------------------------------------------
     def self.analyze(exports)
       channels_by_id   = {}
       channels_by_name = {}
       pending_threads  = []
 
-      # Pass 1: identify top-level channels by type
       exports.each do |export|
         ch = export["channel"]
         next unless ch
@@ -30,14 +27,11 @@ module DiscourseDiscordimport
           message_count: importable,
           skipped_count: skipped,
         }.merge(threads: [])
-        channels_by_id[ch["id"]]               = entry
-        channels_by_name[ch["name"]]           = entry
-        channels_by_name[ch["name"].downcase]  = entry
+        channels_by_id[ch["id"]]              = entry
+        channels_by_name[ch["name"]]          = entry
+        channels_by_name[ch["name"].downcase] = entry
       end
 
-      # Pass 2: everything else is a potential thread.
-      # Files with unknown channel.type (not in CHANNEL_TYPES) were silently dropped
-      # by the old single-pass approach — this catches them all.
       exports.each do |export|
         ch = export["channel"]
         next unless ch
@@ -56,10 +50,6 @@ module DiscourseDiscordimport
         }
       end
 
-      # Nest threads under their parent channels.
-      # Primary match: categoryId == channel id.
-      # Fallback: parse parent channel name from DiscordChatExporter filename
-      #   format "Guild - ChannelName - ThreadName [id].json"
       pending_threads.each do |thread|
         parent = channels_by_id[thread[:parent_channel_id]]
 
@@ -73,34 +63,22 @@ module DiscourseDiscordimport
         if parent
           parent[:threads] << thread.slice(:channel_id, :channel_name, :message_count, :skipped_count)
         else
-          # Orphaned thread — treat as standalone channel with no threads
           channels_by_id[thread[:channel_id]] = thread.slice(
             :channel_id, :channel_name, :guild_name, :message_count, :skipped_count
           ).merge(threads: [])
         end
       end
 
-      users = collect_users(exports)
-
-      {
-        channels: channels_by_id.values,
-        users:    users,
-      }
+      { channels: channels_by_id.values, users: collect_users(exports) }
     end
 
     # ---------------------------------------------------------------------------
-    # import(exports, channel_configs, user_mappings, duplicate_mode:) → results hash
-    #
-    # channel_configs: array of hashes (action, channel_id, topic_id, etc.)
-    # user_mappings:   { discord_user_id => discourse_user_id | "omit" | "anonymous" }
-    # duplicate_mode:  "ignore" | "update"
+    # import(exports, channel_configs, user_mappings, duplicate_mode:) → results
     # ---------------------------------------------------------------------------
     def self.import(exports, channel_configs, user_mappings, duplicate_mode: "ignore")
-      # Index exports by channel id for fast lookup
-      exports_by_channel_id = {}
-      exports.each do |export|
-        id = export.dig("channel", "id")
-        exports_by_channel_id[id] = export if id
+      exports_by_channel_id = exports.each_with_object({}) do |e, h|
+        id = e.dig("channel", "id")
+        h[id] = e if id
       end
 
       results = []
@@ -122,163 +100,175 @@ module DiscourseDiscordimport
         channel_name = main_export.dig("channel", "name")
         log << "=== ##{channel_name} ==="
 
-        # Collect thread exports that belong to this channel.
-        # Anything that isn't a top-level channel type is a candidate thread.
-        # Primary match: categoryId == channel id.
-        # Fallback: filename second segment matches channel name.
+        messages = main_export["messages"] || []
+
+        # Collect thread exports for this channel
         thread_exports = exports.select do |e|
           next false if CHANNEL_TYPES.include?(e.dig("channel", "type"))
           e.dig("channel", "categoryId") == channel_id ||
             extract_parent_channel_name(e["_file_name"]) == channel_name
         end
+        thread_exports_by_id = thread_exports.each_with_object({}) do |te, h|
+          h[te.dig("channel", "id")] = te
+        end
         log << "Found #{thread_exports.size} thread export(s)" if thread_exports.any?
 
-        # Resolve the primary topic
-        topic, posts_created, posts_skipped, posts_updated =
-          if action == "existing"
-            t = Topic.find_by(id: config["topic_id"])
-            raise "Topic #{config["topic_id"]} not found" unless t
-            log << "Importing into existing topic: #{t.url}"
-            created, skipped, updated = import_messages(
-              main_export["messages"] || [],
-              t.id,
-              user_mappings,
-              duplicate_mode: duplicate_mode,
-              log: log,
-            )
-            [t, created, skipped, updated]
-          else
-            title = config["new_topic_title"] || main_export.dig("channel", "name")
-            log << "Creating new topic: \"#{sanitize_title(title)}\""
-            create_topic_from_export(
-              main_export,
-              title,
-              config["new_topic_category_id"],
-              user_mappings,
-              duplicate_mode: duplicate_mode,
-              log: log,
-            )
+        # Identify message IDs that will become thread topic first posts.
+        # These are excluded from the primary topic when split_threads is on.
+        starter_ids = Set.new
+        if split_threads
+          messages.each do |msg|
+            next unless msg["type"] == "ThreadCreated"
+            origin_id = msg.dig("reference", "channelId")
+            starter_ids.add(origin_id) if origin_id && thread_exports_by_id[origin_id]
           end
-
-        unless topic
-          log << "ERROR: Could not create or find topic — skipping channel"
-          results << { channel_name: channel_name, posts_created: 0,
-                       posts_skipped: posts_skipped.to_i, posts_updated: 0,
-                       thread_results: [], log_lines: log }
-          next
         end
 
-        log << "Topic: #{topic.url}"
-        log << "Messages: #{posts_created} imported, #{posts_skipped} skipped" \
-               "#{posts_updated > 0 ? ", #{posts_updated} updated" : ""}"
+        # Find or create the primary topic
+        topic         = nil
+        posts_created = 0
+        posts_skipped = 0
+        posts_updated = 0
 
-        thread_results = []
+        if action == "existing"
+          topic = Topic.find_by(id: config["topic_id"])
+          unless topic
+            log << "ERROR: Topic #{config["topic_id"]} not found"
+            results << { channel_name: channel_name, posts_created: 0, posts_skipped: 0,
+                         posts_updated: 0, thread_results: [], log_lines: log }
+            next
+          end
+          log << "Adding to existing topic: #{topic.url}"
+        else
+          title     = config["new_topic_title"].presence || channel_name
+          first_msg = messages.find { |m| importable_message?(m) && !starter_ids.include?(m["id"]) }
+          unless first_msg
+            log << "ERROR: No importable messages for new topic"
+            results << { channel_name: channel_name, posts_created: 0, posts_skipped: 0,
+                         posts_updated: 0, thread_results: [], log_lines: log }
+            next
+          end
+          log << "Creating topic: \"#{sanitize_title(title)}\""
+          topic, posts_created, posts_skipped, posts_updated = create_topic_from_message(
+            first_msg, title, config["new_topic_category_id"], user_mappings,
+            duplicate_mode: duplicate_mode, log: log,
+          )
+          unless topic
+            log << "ERROR: Could not create topic"
+            results << { channel_name: channel_name, posts_created: 0, posts_skipped: 0,
+                         posts_updated: 0, thread_results: [], log_lines: log }
+            next
+          end
+          log << "Topic: #{topic.url}"
+        end
 
-        if split_threads
-          # Build a lookup map of thread exports by channel id for quick access
-          thread_exports_map = {}
-          thread_exports.each { |te| thread_exports_map[te.dig("channel", "id")] = te }
+        thread_results     = []
+        handled_thread_ids = Set.new
 
-          # Pass 1: handle threads that have a ThreadCreated marker in the main channel.
-          # These get the origin message as the first post, plus a back-link in the parent.
-          handled_thread_ids = {}
-          (main_export["messages"] || []).each do |msg|
-            next unless msg["type"] == "ThreadCreated"
-
+        # Single pass through channel messages:
+        #   ThreadCreated → create thread topic (split mode)
+        #   importable, non-starter → add to primary topic
+        messages.each do |msg|
+          if msg["type"] == "ThreadCreated" && split_threads
             thread_channel_id = msg.dig("reference", "channelId")
-            te = thread_exports_map[thread_channel_id]
+            te = thread_exports_by_id[thread_channel_id]
             next unless te
-
-            # Only use a Default message as origin. Some ThreadCreated markers are
-            # self-referential (id == reference.channelId); those have no real origin message.
-            origin_msg = (main_export["messages"] || []).find do |m|
-              m["id"] == thread_channel_id && m["type"] == "Default"
-            end
+            next if handled_thread_ids.include?(thread_channel_id)
+            handled_thread_ids.add(thread_channel_id)
 
             thread_name = te.dig("channel", "name")
-            log << "Thread (marker): \"#{thread_name}\""
+            log << "Thread: \"#{thread_name}\""
 
-            thread_topic, t_created, t_skipped, t_updated = import_thread_from_marker(
+            # Origin message: the Default message whose ID == thread_channel_id.
+            # nil for self-referential markers.
+            origin_msg = messages.find { |m| m["id"] == thread_channel_id && m["type"] == "Default" }
+
+            thread_topic, tc, ts, tu = import_thread(
               thread_export:  te,
               origin_msg:     origin_msg,
-              parent_topic:   topic,
+              category_id:    topic.category_id,
               user_mappings:  user_mappings,
               duplicate_mode: duplicate_mode,
-              log: log,
+              log:            log,
             )
-            handled_thread_ids[thread_channel_id] = true
 
             if thread_topic
-              log << "  → #{thread_topic.url} (#{t_created} posts, #{t_skipped} skipped)"
+              log << "  → #{thread_topic.url} (#{tc} posts, #{ts} skipped)"
               thread_results << {
                 thread_name:   thread_name,
                 topic_id:      thread_topic.id,
                 topic_url:     thread_topic.url,
-                posts_created: t_created,
-                posts_skipped: t_skipped,
-                posts_updated: t_updated,
+                posts_created: tc,
+                posts_skipped: ts,
+                posts_updated: tu,
               }
             else
-              log << "  → ERROR: thread topic could not be created"
+              log << "  → ERROR: could not create thread topic"
             end
-          end
 
-          # Pass 2: file-based fallback for thread exports with no ThreadCreated marker
-          # (e.g. the parent channel was not fully exported, or private threads).
-          thread_exports.each do |te|
-            next if handled_thread_ids.key?(te.dig("channel", "id"))
+          elsif importable_message?(msg) && !starter_ids.include?(msg["id"])
+            c, s, u = import_messages([msg], topic.id, user_mappings,
+                                      duplicate_mode: duplicate_mode, log: log)
+            posts_created += c
+            posts_skipped += s
+            posts_updated += u
+          end
+        end
+
+        if split_threads
+          # File-based threads: thread exports with no ThreadCreated marker in parent
+          thread_exports_by_id.each do |tid, te|
+            next if handled_thread_ids.include?(tid)
 
             thread_name = te.dig("channel", "name")
             log << "Thread (file): \"#{thread_name}\""
 
-            thread_topic, t_created, t_skipped, t_updated = create_topic_from_export(
-              te, thread_name, topic.category_id, user_mappings,
-              duplicate_mode: duplicate_mode, log: log,
+            thread_topic, tc, ts, tu = import_thread(
+              thread_export:  te,
+              origin_msg:     nil,
+              category_id:    topic.category_id,
+              user_mappings:  user_mappings,
+              duplicate_mode: duplicate_mode,
+              log:            log,
             )
 
             if thread_topic
-              log << "  → #{thread_topic.url} (#{t_created} posts, #{t_skipped} skipped)"
+              log << "  → #{thread_topic.url} (#{tc} posts, #{ts} skipped)"
               thread_results << {
                 thread_name:   thread_name,
                 topic_id:      thread_topic.id,
                 topic_url:     thread_topic.url,
-                posts_created: t_created,
-                posts_skipped: t_skipped,
-                posts_updated: t_updated,
+                posts_created: tc,
+                posts_skipped: ts,
+                posts_updated: tu,
               }
             else
-              log << "  → ERROR: thread topic could not be created"
+              log << "  → ERROR: could not create thread topic"
             end
           end
         else
-          # Merge threads into primary topic in timestamp order
-          sorted_threads = thread_exports.sort_by do |te|
-            te.dig("messages", 0, "timestamp") || ""
-          end
-
-          sorted_threads.each do |te|
+          # Merge mode: append thread messages to the primary topic in timestamp order
+          thread_exports.sort_by { |te| te.dig("messages", 0, "timestamp") || "" }.each do |te|
             thread_name = te.dig("channel", "name")
-            messages    = te["messages"] || []
-            log << "Merging thread: \"#{thread_name}\" (#{messages.size} messages)"
+            thread_msgs = te["messages"] || []
+            log << "Merging thread: \"#{thread_name}\" (#{thread_msgs.size} messages)"
 
-            # Create separator post — use first resolvable user in the thread
-            separator_user = first_resolvable_user(messages, user_mappings)
-            if separator_user
+            separator_user = first_resolvable_user(thread_msgs, user_mappings)
+            if separator_user && thread_msgs.any?
               safe_create_post(
                 separator_user,
-                topic_id: topic.id,
-                raw: "*--- Thread: \"#{thread_name}\" ---*",
-                created_at: DateTime.parse(messages.first["timestamp"]),
-                log: log,
+                topic_id:   topic.id,
+                raw:        "*--- Thread: \"#{thread_name}\" ---*",
+                created_at: DateTime.parse(thread_msgs.first["timestamp"]),
+                log:        log,
               )
             end
 
-            t_created, t_skipped, t_updated = import_messages(
-              messages, topic.id, user_mappings, duplicate_mode: duplicate_mode, log: log,
-            )
-            posts_created += t_created
-            posts_skipped += t_skipped
-            posts_updated += t_updated
+            c, s, u = import_messages(thread_msgs, topic.id, user_mappings,
+                                      duplicate_mode: duplicate_mode, log: log)
+            posts_created += c
+            posts_skipped += s
+            posts_updated += u
           end
         end
 
@@ -318,7 +308,7 @@ module DiscourseDiscordimport
       [importable, skipped]
     end
 
-    # Default = regular message; Reply = message that quotes another message.
+    # Default = regular message; Reply = message that quotes another.
     # Both are user-authored content and should be imported.
     def self.importable_message?(message)
       return false if message.dig("author", "isBot")
@@ -335,15 +325,15 @@ module DiscourseDiscordimport
           id = author["id"]
           next if seen[id]
 
-          nickname = author["nickname"] || author["name"]
+          nickname  = author["nickname"] || author["name"]
           suggested = find_suggested_user(author["name"], nickname)
 
           seen[id] = {
-            discord_id:                  id,
-            name:                        author["name"],
-            nickname:                    nickname,
-            avatar_url:                  author["avatarUrl"],
-            suggested_discourse_user_id: suggested&.id,
+            discord_id:                   id,
+            name:                         author["name"],
+            nickname:                     nickname,
+            avatar_url:                   author["avatarUrl"],
+            suggested_discourse_user_id:  suggested&.id,
             suggested_discourse_username: suggested&.username,
           }
         end
@@ -364,10 +354,10 @@ module DiscourseDiscordimport
         User.find_by(username: "discordimport_anonymous") ||
           User.create!(
             username: "discordimport_anonymous",
-            name: "Anonymous",
-            email: "discordimport-anonymous@imported.invalid",
+            name:     "Anonymous",
+            email:    "discordimport-anonymous@imported.invalid",
             password: SecureRandom.hex(20),
-            staged: true,
+            staged:   true,
             approved: true,
           )
       elsif mapping.is_a?(Hash) && mapping["type"] == "new"
@@ -376,10 +366,10 @@ module DiscourseDiscordimport
         User.find_by(username: username) ||
           User.create!(
             username: username,
-            name: username,
-            email: "discord-#{discord_user_id}@imported.invalid",
+            name:     username,
+            email:    "discord-#{discord_user_id}@imported.invalid",
             password: SecureRandom.hex(20),
-            staged: true,
+            staged:   true,
             approved: true,
           )
       else
@@ -397,16 +387,14 @@ module DiscourseDiscordimport
     end
 
     # Download a Discord CDN attachment and re-upload it to Discourse.
-    # Returns a Discourse Upload object, or nil if the download/upload fails.
-    # Callers should always handle nil and fall back to the original URL.
+    # Returns a Discourse Upload object, or nil on failure.
     def self.upload_attachment(att, user, log: [])
       url      = att["url"].to_s
       filename = att["fileName"].presence || "attachment"
       return nil unless url.start_with?("https://") && user
 
       # Discord CDN URLs contain an ex= hex Unix timestamp for the expiry time.
-      # Attempting to connect to an expired URL can stall for the full open_timeout
-      # (10s × many attachments = request timeout). Detect and skip immediately.
+      # Check before connecting — expired URLs stall for the full open_timeout.
       if (ex_match = url.match(/[?&]ex=([0-9a-f]+)/i))
         if ex_match[1].to_i(16) < Time.now.to_i
           log << "  WARN: CDN link expired for #{filename} (use a fresh export to include attachments)"
@@ -434,7 +422,7 @@ module DiscourseDiscordimport
       end
     rescue => e
       log << "  WARN: Could not upload #{filename}: #{e.message}"
-      Rails.logger.warn("[DiscordImport] Could not upload attachment #{filename}: #{e.message}")
+      Rails.logger.warn("[DiscordImport] Could not upload #{filename}: #{e.message}")
       nil
     ensure
       tempfile&.close
@@ -442,7 +430,7 @@ module DiscourseDiscordimport
     end
 
     def self.format_content(message, user: nil, log: [])
-      parts = []
+      parts   = []
       content = message["content"].to_s.strip
       parts << content unless content.empty?
 
@@ -451,19 +439,11 @@ module DiscourseDiscordimport
         upload   = upload_attachment(att, user, log: log) if user
 
         if upload
-          # UploadMarkdown checks filename extension for image detection and
-          # includes pixel dimensions when available — the correct Discourse format
           parts << UploadMarkdown.new(upload).to_markdown
         else
-          # Fallback to original Discord CDN URL (may expire, but better than nothing).
-          # Check contentType AND filename extension — some exports omit contentType.
           is_image = att["contentType"]&.start_with?("image/") ||
                      att["fileName"].to_s.match?(/\.(png|jpe?g|gif|webp|svg|bmp|tiff?)\z/i)
-          if is_image
-            parts << "![#{filename}](#{att["url"]})"
-          else
-            parts << "[#{filename}](#{att["url"]})"
-          end
+          parts << (is_image ? "![#{filename}](#{att["url"]})" : "[#{filename}](#{att["url"]})")
         end
       end
 
@@ -479,82 +459,87 @@ module DiscourseDiscordimport
       parts.join("\n\n")
     end
 
-    def self.create_topic_from_export(export, title, category_id, user_mappings, duplicate_mode: "ignore", log: [])
-      messages = export["messages"] || []
-      total_importable = messages.count(&method(:importable_message?))
-
-      # Find first importable message with a resolvable user to create the topic
-      first_message = nil
-      first_user    = nil
-      messages.each do |m|
-        next unless importable_message?(m)
-        user = resolve_user(m.dig("author", "id"), user_mappings)
-        next unless user
-        first_message = m
-        first_user    = user
-        break
+    # Create a Discourse topic from a single Discord message, with dedup.
+    # Returns [topic, created, skipped, updated].
+    def self.create_topic_from_message(msg, title, category_id, user_mappings, duplicate_mode: "ignore", log: [])
+      user = resolve_user(msg.dig("author", "id"), user_mappings)
+      unless user
+        log << "  WARN: No resolvable user for message #{msg["id"]}"
+        return [nil, 0, 1, 0]
       end
 
-      unless first_message
-        log << "  WARN: No importable message with resolvable user — skipping"
-        return [nil, 0, total_importable, 0]
-      end
-
-      content = format_content(first_message, user: first_user, log: log)
+      content = format_content(msg, user: user, log: log)
       if content.blank?
-        log << "  WARN: First message content is blank — skipping"
-        return [nil, 0, total_importable, 0]
+        log << "  WARN: Message content is blank"
+        return [nil, 0, 1, 0]
       end
 
-      discord_msg_id   = first_message["id"]
-      existing_field   = discord_msg_id ? PostCustomField.find_by(name: "discord_message_id", value: discord_msg_id) : nil
-      first_created    = 0
-      first_skipped    = 0
-      first_updated    = 0
-      topic            = nil
+      discord_msg_id = msg["id"]
+      existing_field = discord_msg_id ? PostCustomField.find_by(name: "discord_message_id", value: discord_msg_id) : nil
 
       if existing_field
         candidate = existing_field.post&.topic
         if candidate && !candidate.trashed?
-          topic = candidate
           if duplicate_mode == "update"
             existing_field.post.update_columns(raw: content, cooked: PrettyText.cook(content))
-            first_updated = 1
+            Rails.logger.info("[DiscordImport] Updated post #{existing_field.post_id} (msg #{discord_msg_id})")
+            return [candidate, 0, 0, 1]
           else
-            first_skipped = 1
-            log << "  Duplicate: first post already imported (#{duplicate_mode == "ignore" ? "skipping" : "recovering topic"})"
+            log << "  Duplicate: topic already imported"
+            return [candidate, 0, 1, 0]
           end
         else
-          # Topic was deleted — discard stale field and create fresh
-          log << "  Duplicate: first post exists but topic was deleted — reimporting"
+          log << "  Stale record (topic deleted) — reimporting"
           existing_field.destroy
         end
       end
 
-      unless topic
-        post = safe_create_post(
-          first_user,
-          title:      sanitize_title(title),
-          raw:        content,
-          category:   category_id,
-          created_at: DateTime.parse(first_message["timestamp"]),
-          log:        log,
-        )
-        return [nil, 0, total_importable, 0] unless post
-
-        PostCustomField.create!(post_id: post.id, name: "discord_message_id", value: discord_msg_id) if discord_msg_id
-        topic         = post.topic
-        first_created = 1
-      end
-
-      remaining = messages.reject { |m| m["id"] == first_message["id"] }
-      created, skipped, updated = import_messages(
-        remaining, topic.id, user_mappings, duplicate_mode: duplicate_mode, log: log,
+      post = safe_create_post(
+        user,
+        title:      sanitize_title(title),
+        raw:        content,
+        category:   category_id,
+        created_at: DateTime.parse(msg["timestamp"]),
+        log:        log,
       )
+      return [nil, 0, 1, 0] unless post
 
-      [topic, first_created + created, first_skipped + skipped, first_updated + updated]
+      PostCustomField.create!(post_id: post.id, name: "discord_message_id", value: discord_msg_id) if discord_msg_id
+      [post.topic, 1, 0, 0]
     end
 
+    # Create a topic from an export file, using the first importable message as OP.
+    # Used for file-based threads (no origin message) and merge-mode threads.
+    def self.create_topic_from_export(export, title, category_id, user_mappings, duplicate_mode: "ignore", log: [])
+      messages         = export["messages"] || []
+      total_importable = messages.count(&method(:importable_message?))
+
+      first_msg = nil
+      messages.each do |m|
+        next unless importable_message?(m)
+        next unless resolve_user(m.dig("author", "id"), user_mappings)
+        first_msg = m
+        break
+      end
+
+      unless first_msg
+        log << "  WARN: No importable message with resolvable user — skipping"
+        return [nil, 0, total_importable, 0]
+      end
+
+      topic, created, skipped, updated = create_topic_from_message(
+        first_msg, title, category_id, user_mappings,
+        duplicate_mode: duplicate_mode, log: log,
+      )
+      return [nil, 0, total_importable, 0] unless topic
+
+      remaining = messages.reject { |m| m["id"] == first_msg["id"] }
+      c, s, u   = import_messages(remaining, topic.id, user_mappings,
+                                  duplicate_mode: duplicate_mode, log: log)
+      [topic, created + c, skipped + s, updated + u]
+    end
+
+    # Import an array of messages as replies to an existing topic.
     def self.import_messages(messages, topic_id, user_mappings, duplicate_mode: "ignore", log: [])
       created = 0
       skipped = 0
@@ -571,15 +556,15 @@ module DiscourseDiscordimport
           existing_field = discord_msg_id ? PostCustomField.find_by(name: "discord_message_id", value: discord_msg_id) : nil
 
           if existing_field
-            # Only treat as a genuine duplicate if the existing post lives on THIS topic.
-            # If it's on a different (possibly deleted) topic, the field is stale — discard
-            # it and import fresh so the post appears in the correct topic.
+            # Only a genuine duplicate if it's already on THIS topic.
+            # If on a different/deleted topic, the field is stale — discard and reimport.
             if existing_field.post&.topic_id == topic_id
               if duplicate_mode == "update"
-                user = resolve_user(message.dig("author", "id"), user_mappings)
+                user    = resolve_user(message.dig("author", "id"), user_mappings)
                 content = user ? format_content(message, user: user, log: log) : nil
                 if content.present?
                   existing_field.post.update_columns(raw: content, cooked: PrettyText.cook(content))
+                  Rails.logger.info("[DiscordImport] Updated post #{existing_field.post_id} (msg #{discord_msg_id})")
                   updated += 1
                 else
                   skipped += 1
@@ -629,145 +614,51 @@ module DiscourseDiscordimport
       [created, skipped, updated]
     end
 
-    # Create a thread topic using the origin message from the parent channel as the first post.
-    # Appends a back-link to the origin post in the parent topic.
-    # Falls back to create_topic_from_export when origin_msg is unavailable or unusable.
-    def self.import_thread_from_marker(
-      thread_export:, origin_msg:, parent_topic:, user_mappings:, duplicate_mode:, log: []
-    )
-      thread_channel_id = thread_export.dig("channel", "id")
-      thread_name       = thread_export.dig("channel", "name")
+    # Import a Discord thread as a new Discourse topic.
+    # If origin_msg is given, it becomes the topic OP.
+    # Otherwise the first importable message from the thread file is used.
+    def self.import_thread(thread_export:, origin_msg:, category_id:, user_mappings:, duplicate_mode:, log: [])
+      thread_name = thread_export.dig("channel", "name")
+      thread_msgs = thread_export["messages"] || []
 
-      # In Discord, the thread channel ID equals the origin message's snowflake ID.
-      # The origin message is imported as the thread's first post (not via import_messages),
-      # so exclude it from the thread message list to avoid a duplicate.
-      thread_messages = (thread_export["messages"] || []).reject { |m| m["id"] == thread_channel_id }
-
-      created = 0
-      skipped = 0
-      updated = 0
-      topic   = nil
-
-      # Dedup: if we already imported this thread's origin post, recover the topic.
-      existing_origin = PostCustomField.find_by(name: "discord_thread_origin", value: thread_channel_id)
-      if existing_origin
-        candidate = existing_origin.post&.topic
-        if candidate && !candidate.trashed?
-          topic = candidate
-          log << "  Dedup: thread already imported → #{topic.url}"
-        else
-          # The topic is gone or soft-deleted (e.g. cleaned up after a failed run).
-          # Remove the stale field so we can reimport cleanly.
-          log << "  Dedup: stale thread record (topic deleted) — reimporting"
-          existing_origin.destroy
-        end
-      end
-
-      unless topic
-        if origin_msg
-          preview = origin_msg["content"].to_s.slice(0, 60).gsub(/\s+/, " ").strip
-          log << "  Origin: \"#{preview}#{origin_msg["content"].to_s.length > 60 ? "…" : ""}\""
-
-          origin_user = resolve_user(origin_msg.dig("author", "id"), user_mappings)
-
-          # Can't resolve user — fall back to file-based import (no special first post)
-          unless origin_user
-            log << "  WARN: Origin user unmapped — falling back to file-based import"
-            return create_topic_from_export(
-              thread_export, thread_name, parent_topic.category_id, user_mappings,
-              duplicate_mode: duplicate_mode, log: log,
-            )
-          end
-
-          content = format_content(origin_msg, user: origin_user, log: log)
-          if content.blank?
-            log << "  WARN: Origin message content is blank — falling back to file-based import"
-            return create_topic_from_export(
-              thread_export, thread_name, parent_topic.category_id, user_mappings,
-              duplicate_mode: duplicate_mode, log: log,
-            )
-          end
-
-          post = safe_create_post(
-            origin_user,
-            title:      sanitize_title(thread_name),
-            raw:        content,
-            category:   parent_topic.category_id,
-            created_at: DateTime.parse(origin_msg["timestamp"]),
-            log:        log,
-          )
-          return [nil, 0, thread_messages.count(&method(:importable_message?)), 0] unless post
-
-          # Use discord_thread_origin (not discord_message_id) so it doesn't conflict with
-          # the same message's post in the parent topic.
-          PostCustomField.create!(post_id: post.id, name: "discord_thread_origin", value: thread_channel_id)
-          topic   = post.topic
-          created = 1
-        else
-          # No Default origin message — fall back to file-based import
-          log << "  No origin message — using file-based import"
-          return create_topic_from_export(
-            thread_export, thread_name, parent_topic.category_id, user_mappings,
-            duplicate_mode: duplicate_mode, log: log,
-          )
-        end
-      end
-
-      # Import remaining thread messages (each gets its own discord_message_id dedup)
-      t_created, t_skipped, t_updated = import_messages(
-        thread_messages, topic.id, user_mappings, duplicate_mode: duplicate_mode, log: log,
-      )
-      created += t_created
-      skipped += t_skipped
-      updated += t_updated
-
-      # Append a back-link to the origin post in the parent topic.
-      # The guard prevents duplicate links on re-import.
       if origin_msg
-        origin_post_field = PostCustomField.find_by(name: "discord_message_id", value: origin_msg["id"])
-        origin_post = origin_post_field&.post
-        if origin_post && origin_post.topic_id == parent_topic.id
-          link_suffix = "*→ Thread: [#{thread_name}](#{topic.url})*"
-          unless origin_post.raw.include?(link_suffix)
-            new_raw = "#{origin_post.raw.rstrip}\n\n#{link_suffix}"
-            origin_post.update_columns(raw: new_raw, cooked: PrettyText.cook(new_raw))
-            log << "  Back-link added to origin post"
-          else
-            log << "  Back-link already present"
-          end
-        else
-          log << "  WARN: Could not find origin post in parent topic for back-link"
-        end
-      end
+        topic, created, skipped, updated = create_topic_from_message(
+          origin_msg, thread_name, category_id, user_mappings,
+          duplicate_mode: duplicate_mode, log: log,
+        )
+        return [nil, 0, 0, 0] unless topic
 
-      [topic, created, skipped, updated]
+        # Import thread messages, skipping the origin message if it appears in the file
+        remaining = thread_msgs.reject { |m| m["id"] == origin_msg["id"] }
+        c, s, u   = import_messages(remaining, topic.id, user_mappings,
+                                    duplicate_mode: duplicate_mode, log: log)
+        [topic, created + c, skipped + s, updated + u]
+      else
+        # No origin message (self-referential marker or file-based fallback)
+        create_topic_from_export(thread_export, thread_name, category_id, user_mappings,
+                                 duplicate_mode: duplicate_mode, log: log)
+      end
     end
 
     def self.safe_create_post(user, log: [], **opts)
-      PostCreator.create!(
-        user,
-        **opts,
-        skip_validations: true,
-        skip_guardian:    true,
-      )
+      post = PostCreator.create!(user, **opts, skip_validations: true, skip_guardian: true)
+      Rails.logger.info("[DiscordImport] Created post #{post.id} in topic #{post.topic_id}")
+      post
     rescue => e
       log << "  ERROR: Failed to create post: #{e.message}"
-      Rails.logger.error("[DiscordImport] Failed to create post: #{e.message}")
+      Rails.logger.error("[DiscordImport] Failed to create post: #{e.class}: #{e.message}")
       nil
     end
 
-    # Truncate and clean a title to fit Discourse's max topic title length.
-    # Discord thread names can be very long and contain arbitrary Unicode.
     def self.sanitize_title(title)
       title.to_s.strip.slice(0, SiteSetting.max_topic_title_length).presence || "Imported"
     end
 
-    # DiscordChatExporter filenames follow the pattern:
-    #   "Guild - ChannelName - ThreadName [id].json"
-    # The second segment (index 1 after splitting on " - ") is the parent channel name.
+    # DiscordChatExporter filenames: "Guild - ChannelName - ThreadName [id].json"
+    # The second segment (index 1) is the parent channel name.
     def self.extract_parent_channel_name(filename)
       return nil if filename.nil?
-      base = File.basename(filename.to_s, ".json")
+      base  = File.basename(filename.to_s, ".json")
       parts = base.split(" - ")
       return nil unless parts.length >= 3
       parts[1]
